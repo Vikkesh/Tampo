@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
+import os
 
 class PolicyNetwork(nn.Module):
     """Actor network for PPO"""
@@ -72,18 +73,22 @@ class PPOAgent:
     - Generalized Advantage Estimation (GAE)
     - Value function loss
     - Entropy bonus for exploration
+    - Automatic checkpointing and resume capability
     """
     
-    def __init__(self, env, config: Dict):
+    def __init__(self, env, config: Dict, model_path: Optional[str] = None):
         """
         Initialize PPO agent
         
         Args:
             env: Task offloading environment
             config: Configuration dictionary
+            model_path: Path to existing checkpoint (optional)
         """
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        print(f"🔧 Using device: {self.device}")
         
         # Hyperparameters (from ppo.txt)
         self.learning_rate = config.get('learning_rate', 3e-4)
@@ -113,6 +118,33 @@ class PPOAgent:
         
         # Storage for rollout data
         self.reset_storage()
+        
+        # Training history
+        self.training_history = {
+            'episode_rewards': [],
+            'episode_delays': [],
+            'episode_energies': [],
+            'policy_losses': [],
+            'value_losses': [],
+            'episodes': 0,
+            'total_steps': 0,
+            'best_reward': float('-inf')
+        }
+        
+        # Automatic checkpoint loading - no prompts
+        if model_path and os.path.exists(model_path):
+            try:
+                self.load(model_path)
+                print(f"✓ Resuming from checkpoint: {model_path}")
+                print(f"  Previous episodes: {self.training_history['episodes']}")
+                print(f"  Best reward: {self.training_history['best_reward']:.4f}")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to load checkpoint: {e}")
+                print(f"  Starting fresh training")
+        else:
+            if model_path:
+                print(f"✓ No checkpoint found at {model_path}")
+            print("✓ Initialized new PPO model")
     
     def reset_storage(self):
         """Reset experience storage for new rollout"""
@@ -235,6 +267,9 @@ class PPOAgent:
         dataset_size = len(states)
         indices = np.arange(dataset_size)
         
+        epoch_policy_losses = []
+        epoch_value_losses = []
+        
         for epoch in range(self.ppo_epochs):
             # Shuffle data for each epoch
             np.random.shuffle(indices)
@@ -291,26 +326,63 @@ class PPOAgent:
                 )
                 
                 self.optimizer.step()
+                
+                # Store losses
+                epoch_policy_losses.append(policy_loss.item())
+                epoch_value_losses.append(value_loss.item())
+        
+        # Store average losses
+        if len(epoch_policy_losses) > 0:
+            self.training_history['policy_losses'].append(np.mean(epoch_policy_losses))
+            self.training_history['value_losses'].append(np.mean(epoch_value_losses))
         
         # Clear storage after update
         self.reset_storage()
     
-    def train(self, num_episodes: int):
+    def _save_checkpoint(self, path: str):
+        """Save checkpoint with training history"""
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        torch.save({
+            'policy': self.policy.state_dict(),
+            'value': self.value.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'training_history': self.training_history,
+            'config': {
+                'learning_rate': self.learning_rate,
+                'gamma': self.gamma,
+                'gae_lambda': self.gae_lambda,
+                'clip_epsilon': self.clip_epsilon,
+                'value_coef': self.value_coef,
+                'entropy_coef': self.entropy_coef
+            }
+        }, path)
+    
+    def train(self, num_episodes: int, checkpoint_path: str = "models/ppo_checkpoint.pth"):
         """
-        Train the agent using PPO algorithm
+        Train the agent using PPO algorithm with checkpointing
         
         Args:
             num_episodes: Number of training episodes
+            checkpoint_path: Path to save checkpoints
         """
-        print(f"\nTraining PPO Agent for {num_episodes} episodes...")
-        episode_rewards = []
-        episode_delays = []
-        episode_energies = []
+        print(f"\n{'='*60}")
+        print(f"🚀 PPO Training")
+        print(f"{'='*60}")
+        print(f"  Episodes: {num_episodes}")
+        print(f"  Starting from episode: {self.training_history['episodes']}")
+        print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Clip epsilon: {self.clip_epsilon}")
+        print(f"{'='*60}\n")
         
-        episode_count = 0
-        total_steps = 0
+        # Create checkpoint directory
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         
-        while episode_count < num_episodes:
+        start_episode = self.training_history['episodes']
+        episode_count = start_episode
+        
+        while episode_count < start_episode + num_episodes:
             # Step 2: Data Collection (On-Policy Rollout)
             state = self.env.reset()
             episode_reward = 0
@@ -337,7 +409,7 @@ class PPOAgent:
                 
                 state = next_state
                 steps_in_episode += 1
-                total_steps += 1
+                self.training_history['total_steps'] += 1
             
             # Calculate final value for GAE
             if done:
@@ -350,29 +422,55 @@ class PPOAgent:
                 self.update(next_value)
             
             # Track episode metrics
-            episode_rewards.append(episode_reward)
-            episode_delays.append(episode_delay)
-            episode_energies.append(episode_energy)
-            episode_count += 1
+            self.training_history['episode_rewards'].append(episode_reward)
+            self.training_history['episode_delays'].append(episode_delay)
+            self.training_history['episode_energies'].append(episode_energy)
             
-            # Print progress
-            if episode_count % 10 == 0:
-                avg_reward = np.mean(episode_rewards[-10:])
-                avg_delay = np.mean(episode_delays[-10:])
-                avg_energy = np.mean(episode_energies[-10:])
+            # Update episode count
+            episode_count += 1
+            self.training_history['episodes'] = episode_count
+            
+            # Update best reward
+            if episode_reward > self.training_history['best_reward']:
+                self.training_history['best_reward'] = episode_reward
+                # Save best model
+                best_path = checkpoint_path.replace('.pth', '_best.pth')
+                self._save_checkpoint(best_path)
+            
+            # Print progress every 10 episodes
+            if episode_count % 10 == 0 or episode_count == start_episode + 1:
+                avg_reward = np.mean(self.training_history['episode_rewards'][-10:])
+                avg_delay = np.mean(self.training_history['episode_delays'][-10:])
+                avg_energy = np.mean(self.training_history['episode_energies'][-10:])
                 
-                print(f"  Episode {episode_count}/{num_episodes}: "
-                      f"Avg Reward = {avg_reward:.4f}, "
-                      f"Avg Delay = {avg_delay:.4f}s, "
-                      f"Avg Energy = {avg_energy:.4f}J")
+                avg_policy_loss = np.mean(self.training_history['policy_losses'][-10:]) if len(self.training_history['policy_losses']) > 0 else 0
+                avg_value_loss = np.mean(self.training_history['value_losses'][-10:]) if len(self.training_history['value_losses']) > 0 else 0
+                
+                print(f"  Episode {episode_count:3d}/{start_episode + num_episodes} | "
+                      f"Reward: {avg_reward:.2f} | "
+                      f"Delay: {avg_delay:.2f}s | "
+                      f"Energy: {avg_energy:.2f}J | "
+                      f"Policy Loss: {avg_policy_loss:.4f} | "
+                      f"Value Loss: {avg_value_loss:.4f}")
+            
+            # Save checkpoint every 20 episodes
+            if episode_count % 20 == 0:
+                self._save_checkpoint(checkpoint_path)
         
-        print(f"\n✓ Training completed! Total steps: {total_steps}")
+        # Final save
+        self._save_checkpoint(checkpoint_path)
+        
+        print(f"\n✓ Training complete!")
+        print(f"  Total episodes: {self.training_history['episodes']}")
+        print(f"  Total steps: {self.training_history['total_steps']}")
+        print(f"  Best reward: {self.training_history['best_reward']:.4f}")
+        print(f"  Model saved to: {checkpoint_path}")
         
         # Print final statistics
         print(f"\nFinal Training Statistics:")
-        print(f"  Average Reward: {np.mean(episode_rewards[-100:]):.4f}")
-        print(f"  Average Delay: {np.mean(episode_delays[-100:]):.4f}s")
-        print(f"  Average Energy: {np.mean(episode_energies[-100:]):.4f}J")
+        print(f"  Average Reward (last 100): {np.mean(self.training_history['episode_rewards'][-100:]):.4f}")
+        print(f"  Average Delay (last 100): {np.mean(self.training_history['episode_delays'][-100:]):.4f}s")
+        print(f"  Average Energy (last 100): {np.mean(self.training_history['episode_energies'][-100:]):.4f}J")
     
     def evaluate(self, num_episodes: int = 20):
         """
@@ -412,18 +510,22 @@ class PPOAgent:
         }
     
     def save(self, path: str):
-        """Save model weights"""
-        torch.save({
-            'policy': self.policy.state_dict(),
-            'value': self.value.state_dict(),
-            'optimizer': self.optimizer.state_dict()
-        }, path)
-        print(f"Model saved to {path}")
+        """Save model"""
+        self._save_checkpoint(path)
+        print(f"✓ Model saved to {path}")
     
     def load(self, path: str):
-        """Load model weights"""
-        checkpoint = torch.load(path, map_location=self.device)
+        """Load model"""
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint not found at {path}")
+        
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.policy.load_state_dict(checkpoint['policy'])
         self.value.load_state_dict(checkpoint['value'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        print(f"Model loaded from {path}")
+        
+        # Load training history if available
+        if 'training_history' in checkpoint:
+            self.training_history = checkpoint['training_history']
+        
+        print(f"✓ Model loaded from {path}")

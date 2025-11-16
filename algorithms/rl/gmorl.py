@@ -5,6 +5,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
 import copy
+import os
 
 class HistogramEncoder(nn.Module):
     """
@@ -291,11 +292,14 @@ class GMORLAgent:
     - Multi-objective Q-value estimation
     - Coverage set for diverse preference exploration
     - Discrete-SAC update mechanism
+    - Automatic checkpointing and resume capability
     """
     
-    def __init__(self, env, config: Dict):
+    def __init__(self, env, config: Dict, model_path: Optional[str] = None):
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        print(f"🔧 Using device: {self.device}")
         
         # Hyperparameters
         self.learning_rate = config.get('learning_rate', 3e-4)
@@ -361,12 +365,29 @@ class GMORLAgent:
         self.buffer = []
         self.batch_size = config.get('batch_size', 64)
         
-        # Training metrics
-        self.training_metrics = {
+        # Training history
+        self.training_history = {
             'policy_loss': [],
             'value_loss': [],
-            'alpha': []
+            'alpha': [],
+            'episodes': 0,
+            'best_loss': float('inf')
         }
+        
+        # Automatic checkpoint loading - no prompts
+        if model_path and os.path.exists(model_path):
+            try:
+                self.load(model_path)
+                print(f"✓ Resuming from checkpoint: {model_path}")
+                print(f"  Previous episodes: {self.training_history['episodes']}")
+                print(f"  Best loss: {self.training_history['best_loss']:.4f}")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to load checkpoint: {e}")
+                print(f"  Starting fresh training")
+        else:
+            if model_path:
+                print(f"✓ No checkpoint found at {model_path}")
+            print("✓ Initialized new GMORL model")
     
     def select_action(
         self, 
@@ -507,9 +528,14 @@ class GMORLAgent:
         self._soft_update(self.critic2, self.critic2_target)
         
         # Store metrics
-        self.training_metrics['policy_loss'].append(actor_loss.item())
-        self.training_metrics['value_loss'].append((critic1_loss.item() + critic2_loss.item()) / 2)
-        self.training_metrics['alpha'].append(self.alpha)
+        self.training_history['policy_loss'].append(actor_loss.item())
+        self.training_history['value_loss'].append((critic1_loss.item() + critic2_loss.item()) / 2)
+        self.training_history['alpha'].append(self.alpha)
+        
+        # Update best loss
+        current_loss = actor_loss.item() + (critic1_loss.item() + critic2_loss.item()) / 2
+        if current_loss < self.training_history['best_loss']:
+            self.training_history['best_loss'] = current_loss
     
     def _soft_update(self, source, target):
         """Soft update of target network"""
@@ -532,11 +558,52 @@ class GMORLAgent:
         
         return batch
     
-    def train(self, num_episodes: int):
-        """Train the agent with diverse preferences"""
-        print(f"\nTraining GMORL for {num_episodes} episodes...")
+    def _save_checkpoint(self, path: str):
+        """Save checkpoint with training history"""
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic1': self.critic1.state_dict(),
+            'critic2': self.critic2.state_dict(),
+            'critic1_target': self.critic1_target.state_dict(),
+            'critic2_target': self.critic2_target.state_dict(),
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic1_optimizer': self.critic1_optimizer.state_dict(),
+            'critic2_optimizer': self.critic2_optimizer.state_dict(),
+            'alpha_optimizer': self.alpha_optimizer.state_dict(),
+            'log_alpha': self.log_alpha,
+            'coverage_set': self.coverage_set.preferences,
+            'buffer': self.buffer[-10000:],  # Save last 10k experiences
+            'training_history': self.training_history
+        }, path)
+    
+    def train(self, num_episodes: int, checkpoint_path: str = "models/gmorl_checkpoint.pth"):
+        """
+        Train the agent with diverse preferences and checkpointing
+        
+        Args:
+            num_episodes: Number of training episodes
+            checkpoint_path: Path to save checkpoints
+        """
+        print(f"\n{'='*60}")
+        print(f"🚀 GMORL Training")
+        print(f"{'='*60}")
+        print(f"  Episodes: {num_episodes}")
+        print(f"  Starting from episode: {self.training_history['episodes']}")
+        print(f"  Learning rate: {self.learning_rate}")
+        print(f"  Target entropy: {self.target_entropy:.4f}")
+        print(f"{'='*60}\n")
+        
+        # Create checkpoint directory
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        
+        start_episode = self.training_history['episodes']
         
         for episode in range(num_episodes):
+            current_episode = start_episode + episode
+            
             # Sample preference from coverage set
             preference = self.coverage_set.sample_preference()
             
@@ -575,34 +642,48 @@ class GMORLAgent:
                 if len(self.buffer) >= self.batch_size:
                     self.update()
             
-            if episode % 10 == 0:
-                avg_policy_loss = np.mean(self.training_metrics['policy_loss'][-100:]) if len(self.training_metrics['policy_loss']) > 0 else 0
-                avg_value_loss = np.mean(self.training_metrics['value_loss'][-100:]) if len(self.training_metrics['value_loss']) > 0 else 0
-                print(f"Episode {episode}/{num_episodes} | "
+            # Update episode count
+            self.training_history['episodes'] = current_episode + 1
+            
+            # Progress reporting
+            if (episode + 1) % 10 == 0 or episode == 0:
+                avg_policy_loss = np.mean(self.training_history['policy_loss'][-100:]) if len(self.training_history['policy_loss']) > 0 else 0
+                avg_value_loss = np.mean(self.training_history['value_loss'][-100:]) if len(self.training_history['value_loss']) > 0 else 0
+                print(f"  Episode {current_episode + 1:3d}/{start_episode + num_episodes} | "
                       f"Pref: [{preference[0]:.2f}, {preference[1]:.2f}] | "
                       f"Delay: {episode_delay:.2f}s | Energy: {episode_energy:.2f}J | "
                       f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
                       f"Alpha: {self.alpha:.4f}")
+            
+            # Save checkpoint every 20 episodes
+            if (episode + 1) % 20 == 0:
+                self._save_checkpoint(checkpoint_path)
+            
+            # Save best model
+            if len(self.training_history['policy_loss']) > 0:
+                current_loss = self.training_history['policy_loss'][-1] + self.training_history['value_loss'][-1]
+                if current_loss < self.training_history['best_loss']:
+                    best_path = checkpoint_path.replace('.pth', '_best.pth')
+                    self._save_checkpoint(best_path)
+        
+        # Final save
+        self._save_checkpoint(checkpoint_path)
+        print(f"\n✓ Training complete!")
+        print(f"  Total episodes: {self.training_history['episodes']}")
+        print(f"  Best loss: {self.training_history['best_loss']:.4f}")
+        print(f"  Model saved to: {checkpoint_path}")
     
     def save(self, path: str):
         """Save model"""
-        torch.save({
-            'actor': self.actor.state_dict(),
-            'critic1': self.critic1.state_dict(),
-            'critic2': self.critic2.state_dict(),
-            'critic1_target': self.critic1_target.state_dict(),
-            'critic2_target': self.critic2_target.state_dict(),
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic1_optimizer': self.critic1_optimizer.state_dict(),
-            'critic2_optimizer': self.critic2_optimizer.state_dict(),
-            'alpha_optimizer': self.alpha_optimizer.state_dict(),
-            'log_alpha': self.log_alpha,
-            'coverage_set': self.coverage_set.preferences
-        }, path)
+        self._save_checkpoint(path)
+        print(f"✓ Model saved to {path}")
     
     def load(self, path: str):
         """Load model"""
-        checkpoint = torch.load(path, map_location=self.device)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint not found at {path}")
+        
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic1.load_state_dict(checkpoint['critic1'])
         self.critic2.load_state_dict(checkpoint['critic2'])
@@ -615,3 +696,13 @@ class GMORLAgent:
         self.log_alpha = checkpoint['log_alpha']
         self.alpha = self.log_alpha.exp().item()
         self.coverage_set.preferences = checkpoint['coverage_set']
+        
+        # Load buffer if available
+        if 'buffer' in checkpoint:
+            self.buffer = checkpoint['buffer']
+        
+        # Load training history
+        if 'training_history' in checkpoint:
+            self.training_history = checkpoint['training_history']
+        
+        print(f"✓ Model loaded from {path}")

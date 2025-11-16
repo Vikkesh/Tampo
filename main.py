@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from env.base_offloading_env import TaskOffloadingEnv
 from utils.dag_parser import DAGParser
 from utils.metrics import calculate_hypervolume, normalize_objectives
+from utils.common_evaluator import CommonEvaluator
 
 from algorithms.heuristic.heft import HEFTScheduler
 from algorithms.heuristic.pso import PSOScheduler
@@ -143,173 +144,99 @@ def get_user_input():
     
     return algorithms
 
-def test_heft(env, dag_parser, num_tasks=10):
-    """Test HEFT algorithm"""
-    print("\nTesting HEFT...")
-    dags = dag_parser.load_dataset(num_graphs=num_tasks)
-    
-    if len(dags) == 0:
-        print("Warning: No DAG graphs loaded.")
-        return None
-    
+def test_heft(env, dag_parser, evaluator, num_tasks=10):
+    """Test HEFT algorithm using common evaluator"""
+    print("\n[1/6] Testing HEFT...")
     heft = HEFTScheduler(env)
-    delays, energies = [], []
-    
-    for dag in dags:
-        schedule, delay, energy = heft.schedule(dag)
-        delays.append(delay)
-        energies.append(energy)
-    
-    result = {
-        'avg_delay': np.mean(delays),
-        'avg_energy': np.mean(energies),
-        'std_delay': np.std(delays),
-        'std_energy': np.std(energies)
-    }
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
+    result = evaluator.evaluate_heuristic(heft, dag_parser, num_tasks)
+    if result:
+        print("✓ HEFT completed")
     return result
 
-def test_pso(env, dag_parser, config, num_tasks=10):
-    """Test PSO algorithm"""
-    print("\nTesting PSO...")
-    dags = dag_parser.load_dataset(num_graphs=num_tasks)
-    
-    if len(dags) == 0:
-        print("Warning: No DAG graphs loaded.")
-        return None
-    
+def test_pso(env, dag_parser, config, evaluator, num_tasks=10):
+    """Test PSO algorithm using common evaluator"""
+    print("\n[2/6] Testing PSO...")
     pso = PSOScheduler(env, config['algorithms']['pso'])
-    delays, energies = [], []
-    
-    for dag in dags:
-        preference = np.array([0.5, 0.5])
-        schedule, delay, energy = pso.optimize(dag, preference)
-        delays.append(delay)
-        energies.append(energy)
-    
-    result = {
-        'avg_delay': np.mean(delays),
-        'avg_energy': np.mean(energies),
-        'std_delay': np.std(delays),
-        'std_energy': np.std(energies)
-    }
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
+    result = evaluator.evaluate_heuristic(pso, dag_parser, num_tasks)
+    if result:
+        print("✓ PSO completed")
     return result
 
-def test_ga(env, dag_parser, config, num_tasks=10):
-    """Test GA algorithm"""
-    print("\nTesting GA...")
-    dags = dag_parser.load_dataset(num_graphs=num_tasks)
-    
-    if len(dags) == 0:
-        print("Warning: No DAG graphs loaded.")
-        return None
-    
+def test_ga(env, dag_parser, config, evaluator, num_tasks=10):
+    """Test GA algorithm using common evaluator"""
+    print("\n[3/6] Testing GA...")
     ga = GAScheduler(env, config['algorithms']['ga'])
-    delays, energies = [], []
-    
-    for dag in dags:
-        preference = np.array([0.5, 0.5])
-        schedule, delay, energy = ga.optimize(dag, preference)
-        delays.append(delay)
-        energies.append(energy)
-    
-    result = {
-        'avg_delay': np.mean(delays),
-        'avg_energy': np.mean(energies),
-        'std_delay': np.std(delays),
-        'std_energy': np.std(energies)
-    }
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
+    result = evaluator.evaluate_heuristic(ga, dag_parser, num_tasks)
+    if result:
+        print("✓ GA completed")
     return result
 
-def test_ppo(env, config, train_episodes=100, eval_episodes=20):
-    """Test PPO algorithm"""
-    print(f"\nTraining PPO ({train_episodes} episodes)...")
-    ppo = PPOAgent(env, config['training'])
-    ppo.train(num_episodes=train_episodes)
+def test_ppo(env, config, evaluator, train_episodes=100):
+    """Test PPO algorithm using common evaluator"""
     
-    print(f"Evaluating PPO ({eval_episodes} episodes)...")
-    delays, energies = [], []
+    # Define checkpoint path
+    checkpoint_path = "models/ppo_checkpoint.pth"
     
-    for _ in range(eval_episodes):
-        state = env.reset()
-        done = False
-        episode_delay = 0
-        episode_energy = 0
-        
-        while not done:
-            action, _, _ = ppo.select_action(state, deterministic=True)
-            state, reward, done, info = env.step(action)
-            episode_delay += info['delay']
-            episode_energy += info['energy']
-        
-        delays.append(episode_delay)
-        energies.append(episode_energy)
+    # Always use checkpoint if it exists - no user prompt
+    if os.path.exists(checkpoint_path):
+        print(f"\n📂 Found existing PPO checkpoint - resuming training")
+    else:
+        print(f"\n🆕 No existing checkpoint found - starting fresh training")
     
-    result = {
-        'avg_delay': np.mean(delays),
-        'avg_energy': np.mean(energies),
-        'std_delay': np.std(delays),
-        'std_energy': np.std(energies)
-    }
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
+    print(f"\n[4/6] Training PPO ({train_episodes} episodes)...")
+    
+    # Pass checkpoint path to agent initialization
+    ppo = PPOAgent(env, config['training'], model_path=checkpoint_path)
+    ppo.train(num_episodes=train_episodes, checkpoint_path=checkpoint_path)
+    
+    print(f"\nEvaluating PPO...")
+    result = evaluator.evaluate_rl_agent(ppo, agent_type='ppo')
+    if result:
+        print("✓ PPO completed")
     return result
 
-def test_gmorl(env, config, train_episodes=100, eval_episodes=20):
-    """Test GMORL algorithm"""
-    print(f"\nTraining GMORL ({train_episodes} episodes)...")
-    gmorl = GMORLAgent(env, config['training'])
-    gmorl.train(num_episodes=train_episodes)
+def test_gmorl(env, config, evaluator, train_episodes=100):
+    """Test GMORL algorithm using common evaluator"""
     
-    print(f"Evaluating GMORL ({eval_episodes} episodes)...")
-    preferences = [
-        np.array([0.8, 0.2]),  # Delay-focused
-        np.array([0.5, 0.5]),  # Balanced
-        np.array([0.2, 0.8])   # Energy-focused
-    ]
+    # Define checkpoint path
+    checkpoint_path = "models/gmorl_checkpoint.pth"
     
-    delays, energies = [], []
+    # Always use checkpoint if it exists - no user prompt
+    if os.path.exists(checkpoint_path):
+        print(f"\n📂 Found existing GMORL checkpoint - resuming training")
+    else:
+        print(f"\n🆕 No existing checkpoint found - starting fresh training")
     
-    for pref in preferences:
-        for _ in range(eval_episodes // 3):
-            state = env.reset(preference_vector=pref)
-            done = False
-            episode_delay = 0
-            episode_energy = 0
-            
-            while not done:
-                action, _, _ = gmorl.select_action(state, pref, deterministic=True)
-                state, reward, done, info = env.step(action)
-                episode_delay += info['delay']
-                episode_energy += info['energy']
-            
-            delays.append(episode_delay)
-            energies.append(episode_energy)
+    print(f"\n[5/6] Training GMORL ({train_episodes} episodes)...")
     
-    result = {
-        'avg_delay': np.mean(delays),
-        'avg_energy': np.mean(energies),
-        'std_delay': np.std(delays),
-        'std_energy': np.std(energies)
-    }
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
+    # Pass checkpoint path to agent initialization
+    gmorl = GMORLAgent(env, config['training'], model_path=checkpoint_path)
+    gmorl.train(num_episodes=train_episodes, checkpoint_path=checkpoint_path)
+    
+    print(f"\nEvaluating GMORL...")
+    result = evaluator.evaluate_rl_agent(gmorl, agent_type='gmorl')
+    if result:
+        print("✓ GMORL completed")
     return result
 
-def test_tampo(env, dag_parser, config, train_iterations=100, eval_episodes=20):
-    """Test TAM-PO algorithm"""
-    print(f"\nTraining TAM-PO ({train_iterations} iterations)...")
+def test_tampo(env, dag_parser, config, evaluator, train_iterations=100):
+    """Test TAM-PO algorithm using common evaluator"""
+    
+    # Define checkpoint path
+    checkpoint_path = "models/tampo_checkpoint.pth"
+    
+    # Always use checkpoint if it exists - no user prompt
+    if os.path.exists(checkpoint_path):
+        print(f"\n📂 Found existing TAM-PO checkpoint - resuming training")
+    else:
+        print(f"\n🆕 No existing checkpoint found - starting fresh training")
     
     # Load task dataset
+    print("\n📚 Loading task dataset...")
     task_graphs = dag_parser.load_dataset(num_graphs=50)
     
     if len(task_graphs) == 0:
-        print("Warning: No task graphs loaded.")
+        print("⚠️  Warning: No task graphs loaded.")
         return None
     
     # Convert DAG format
@@ -326,26 +253,24 @@ def test_tampo(env, dag_parser, config, train_iterations=100, eval_episodes=20):
     
     # Load tasks into environment
     env.load_task_dataset(tasks_for_env)
+    print(f"✓ Loaded {len(tasks_for_env)} tasks")
     
-    # Create and train TAM-PO
-    tampo_framework = TAMPOFramework(env, config['training'])
+    # Create TAM-PO framework - checkpoint loaded automatically in __init__
+    print(f"\n[6/6] Training TAM-PO ({train_iterations} meta-iterations)...")
+    tampo_framework = TAMPOFramework(env, config['training'], model_path=checkpoint_path)
+    
+    # Train
     tampo_framework.train(
         num_iterations=train_iterations,
-        meta_batch_size=min(10, len(tasks_for_env))
+        meta_batch_size=min(10, len(tasks_for_env)),
+        checkpoint_path=checkpoint_path
     )
     
-    # Evaluate
-    print(f"Evaluating TAM-PO ({eval_episodes} episodes)...")
-    result = tampo_framework.evaluate(num_episodes=eval_episodes)
-    
-    print(f"  Avg Delay: {result['avg_delay']:.4f}s")
-    print(f"  Avg Energy: {result['avg_energy']:.4f}J")
-    
-    # Save model
-    model_dir = "models"
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "tampo_trained.pth")
-    tampo_framework.save(model_path)
+    # Evaluate using common evaluator
+    print(f"\nEvaluating TAM-PO...")
+    result = evaluator.evaluate_rl_agent(tampo_framework, agent_type='tampo')
+    if result:
+        print("✓ TAM-PO completed")
     
     return result
 
@@ -353,15 +278,21 @@ def save_results(results, output_dir):
     """Save results to JSON and generate plots"""
     os.makedirs(output_dir, exist_ok=True)
     
+    # Filter out None results
+    valid_results = {k: v for k, v in results.items() if v is not None}
+    
+    if len(valid_results) == 0:
+        print("\n⚠️  No valid results to save")
+        return
+    
     # Save JSON
     results_file = os.path.join(output_dir, 'results.json')
     with open(results_file, 'w') as f:
-        json.dump(results, f, indent=4)
+        json.dump(valid_results, f, indent=4)
     print(f"\nResults saved to {results_file}")
     
-    # Generate plots if results exist
-    if len(results) > 0:
-        plot_comparison(results, output_dir)
+    # Generate plots
+    plot_comparison(valid_results, output_dir)
 
 def plot_comparison(results, output_dir):
     """Generate comparison plots"""
@@ -463,70 +394,60 @@ def main():
     # Setup DAG parser
     dag_parser = DAGParser(data_folder="data/meta_offloading_20/offload_random20_1")
     
+    # Create common evaluator
+    print("\n🔧 Initializing Common Evaluator...")
+    evaluator = CommonEvaluator(env, {
+        'eval_episodes': user_choices['eval_episodes'],
+        'max_steps': config['system']['max_steps']
+    })
+    
     # Run selected algorithms
     results = {}
     
     print("\n" + "="*70)
-    print("Starting Algorithm Execution")
+    print("🚀 Starting Algorithm Execution")
     print("="*70)
     
     # Heuristic algorithms
     if user_choices['HEFT']:
-        result = test_heft(env, dag_parser, user_choices['heuristic_tasks'])
+        result = test_heft(env, dag_parser, evaluator, user_choices['heuristic_tasks'])
         if result:
             results['HEFT'] = result
     
     if user_choices['PSO']:
-        result = test_pso(env, dag_parser, config, user_choices['heuristic_tasks'])
+        result = test_pso(env, dag_parser, config, evaluator, user_choices['heuristic_tasks'])
         if result:
             results['PSO'] = result
     
     if user_choices['GA']:
-        result = test_ga(env, dag_parser, config, user_choices['heuristic_tasks'])
+        result = test_ga(env, dag_parser, config, evaluator, user_choices['heuristic_tasks'])
         if result:
             results['GA'] = result
     
     # RL algorithms
     if user_choices['PPO']:
-        result = test_ppo(env, config, user_choices['ppo_episodes'], user_choices['eval_episodes'])
+        result = test_ppo(env, config, evaluator, user_choices['ppo_episodes'])
         if result:
             results['PPO'] = result
     
     if user_choices['GMORL']:
-        result = test_gmorl(env, config, user_choices['gmorl_episodes'], user_choices['eval_episodes'])
+        result = test_gmorl(env, config, evaluator, user_choices['gmorl_episodes'])
         if result:
             results['GMORL'] = result
     
     if user_choices['TAMPO']:
-        result = test_tampo(env, dag_parser, config, user_choices['tampo_iterations'], user_choices['eval_episodes'])
+        result = test_tampo(env, dag_parser, config, evaluator, user_choices['tampo_iterations'])
         if result:
             results['TAMPO'] = result
+    
+    # Display detailed comparison using common evaluator
+    if len(results) > 0:
+        evaluator.compare_algorithms(results)
     
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.join('results', timestamp)
     save_results(results, output_dir)
-    
-    # Print summary
-    print("\n" + "="*70)
-    print(" "*25 + "EXPERIMENT COMPLETE!")
-    print("="*70)
-    
-    if len(results) > 0:
-        print("\n📊 Results Summary:")
-        print("-" * 70)
-        print(f"{'Algorithm':<15} {'Avg Delay (s)':<15} {'Avg Energy (J)':<15}")
-        print("-" * 70)
-        for alg, metrics in results.items():
-            print(f"{alg:<15} {metrics['avg_delay']:<15.4f} {metrics['avg_energy']:<15.4f}")
-        print("-" * 70)
-        
-        # Find best performers
-        best_delay_alg = min(results.items(), key=lambda x: x[1]['avg_delay'])
-        best_energy_alg = min(results.items(), key=lambda x: x[1]['avg_energy'])
-        
-        print(f"\n🏆 Best Delay: {best_delay_alg[0]} ({best_delay_alg[1]['avg_delay']:.4f}s)")
-        print(f"🏆 Best Energy: {best_energy_alg[0]} ({best_energy_alg[1]['avg_energy']:.4f}J)")
     
     print(f"\n📁 Results saved to: {output_dir}")
     print("\n" + "="*70 + "\n")
