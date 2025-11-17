@@ -182,7 +182,7 @@ class CommonEvaluator:
             return action
             
         elif agent_type == 'tampo':
-            # TAM-PO: use internal policy
+            # TAM-PO: use fully deterministic argmax
             task_features = self._extract_task_features(state)
             server_features = self._extract_server_features(state)
             
@@ -196,8 +196,9 @@ class CommonEvaluator:
                     task_tensor, server_tensor, pref_tensor, num_tasks=1
                 )
                 
-                # Deterministic: argmax
-                action = torch.argmax(logits[:, 0, :], dim=-1).item()
+                # Fully deterministic: argmax without any randomness
+                probs = torch.softmax(logits[:, 0, :], dim=-1)
+                action = torch.argmax(probs, dim=-1).item()
             
             return action
         else:

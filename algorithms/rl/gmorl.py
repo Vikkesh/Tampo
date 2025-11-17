@@ -282,18 +282,7 @@ class CoverageSet:
         return True
 
 class GMORLAgent:
-    """
-    Generalizable Multi-Objective Reinforcement Learning Agent
-    Based on Discrete-SAC for discrete action spaces
-    
-    Key features:
-    - Preference-conditioned policy and Q-networks
-    - Histogram-based server workload encoding
-    - Multi-objective Q-value estimation
-    - Coverage set for diverse preference exploration
-    - Discrete-SAC update mechanism
-    - Automatic checkpointing and resume capability
-    """
+    """GMORL with aggressive learning"""
     
     def __init__(self, env, config: Dict, model_path: Optional[str] = None):
         self.env = env
@@ -301,29 +290,31 @@ class GMORLAgent:
         
         print(f"🔧 Using device: {self.device}")
         
-        # Hyperparameters
-        self.learning_rate = config.get('learning_rate', 3e-4)
+        # AGGRESSIVE hyperparameters
+        self.learning_rate = config.get('learning_rate', 1e-3)  # Higher
         self.gamma = config.get('gamma', 0.99)
-        self.tau = config.get('tau', 0.005)  # Soft update parameter
+        self.tau = config.get('tau', 0.01)  # Faster target update
         self.clip_epsilon = config.get('clip_epsilon', 0.2)
         self.num_objectives = 2
         
         # Discrete-SAC specific
-        self.alpha = config.get('alpha', 0.2)  # Temperature parameter
-        self.target_entropy = -np.log(1.0 / env.action_space.n) * 0.98
+        self.alpha = config.get('alpha', 0.01)  # Very low temperature
+        self.target_entropy = -np.log(1.0 / env.action_space.n) * 0.5
         
         # Environment dimensions
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.n
         num_servers = env.num_servers
-        hidden_dims = config.get('hidden_dims', [256, 256])
+        hidden_dims = config.get('hidden_dims', [128, 128])  # Smaller
         
         # Networks
         self.actor = PreferenceConditionedActorNetwork(
             obs_dim, action_dim, num_servers, hidden_dims
         ).to(self.device)
         
-        # Two Q-networks (standard SAC practice)
+        # EXTREME initialization
+        self._initialize_with_bias(action_dim)
+        
         self.critic1 = MultiObjectiveCriticNetwork(
             obs_dim, action_dim, num_servers, hidden_dims
         ).to(self.device)
@@ -332,11 +323,10 @@ class GMORLAgent:
             obs_dim, action_dim, num_servers, hidden_dims
         ).to(self.device)
         
-        # Target Q-networks
+        # Target networks
         self.critic1_target = copy.deepcopy(self.critic1)
         self.critic2_target = copy.deepcopy(self.critic2)
         
-        # Freeze target networks
         for param in self.critic1_target.parameters():
             param.requires_grad = False
         for param in self.critic2_target.parameters():
@@ -353,17 +343,17 @@ class GMORLAgent:
             self.critic2.parameters(), lr=self.learning_rate
         )
         
-        # Automatic temperature tuning
+        # Temperature
         self.log_alpha = torch.tensor(np.log(self.alpha), requires_grad=True, device=self.device)
         self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.learning_rate)
         
-        # Coverage set for preference diversity
+        # Coverage set
         self.coverage_set = CoverageSet()
         
         # Replay buffer
         self.buffer_size = config.get('buffer_size', 100000)
         self.buffer = []
-        self.batch_size = config.get('batch_size', 64)
+        self.batch_size = config.get('batch_size', 128)  # Larger batches
         
         # Training history
         self.training_history = {
@@ -374,21 +364,33 @@ class GMORLAgent:
             'best_loss': float('inf')
         }
         
-        # Automatic checkpoint loading - no prompts
+        # Load checkpoint
         if model_path and os.path.exists(model_path):
             try:
                 self.load(model_path)
-                print(f"✓ Resuming from checkpoint: {model_path}")
-                print(f"  Previous episodes: {self.training_history['episodes']}")
-                print(f"  Best loss: {self.training_history['best_loss']:.4f}")
+                print(f"✓ Resuming from checkpoint")
             except Exception as e:
-                print(f"⚠️  Warning: Failed to load checkpoint: {e}")
-                print(f"  Starting fresh training")
+                print(f"⚠️  Starting fresh")
         else:
-            if model_path:
-                print(f"✓ No checkpoint found at {model_path}")
-            print("✓ Initialized new GMORL model")
+            print("✓ Initialized GMORL with EXTREME offloading bias")
     
+    def _initialize_with_bias(self, action_dim: int):
+        """EXTREME initialization"""
+        with torch.no_grad():
+            final_layer = self.actor.policy_head[-1]
+            # Destroy local
+            final_layer.weight[0, :] *= 0.01
+            final_layer.bias[0] = -10.0
+            
+            # Boost cloud massively
+            final_layer.weight[1, :] *= 5.0
+            final_layer.bias[1] = 5.0
+            
+            # Boost edges
+            for i in range(2, action_dim):
+                final_layer.weight[i, :] *= 4.0
+                final_layer.bias[i] = 4.0
+
     def select_action(
         self, 
         state: np.ndarray, 

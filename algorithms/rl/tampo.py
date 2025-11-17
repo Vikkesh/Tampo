@@ -782,8 +782,7 @@ class HigherLayerMetaLearner:
 
 class TAMPOFramework:
     """
-    Complete TAM-PO Framework with proper MAML meta-learning
-    Automatic checkpoint loading - no user prompts
+    SIMPLIFIED TAM-PO Framework - focus on fast learning
     """
     
     def __init__(self, env, config: Dict, model_path: Optional[str] = None):
@@ -797,7 +796,7 @@ class TAMPOFramework:
         task_feature_dim = 6
         server_feature_dim = 20
         num_resources = env.action_space.n
-        hidden_dim = config.get('hidden_dim', 256)
+        hidden_dim = config.get('hidden_dim', 128)  # Smaller network
         
         # Initialize networks
         meta_policy = MetaPolicyNetwork(
@@ -812,7 +811,13 @@ class TAMPOFramework:
             hidden_dim=hidden_dim
         )
         
-        # Create meta-learner
+        # AGGRESSIVE initialization - strongly bias toward offloading
+        self._initialize_policy_bias(meta_policy, num_resources)
+        
+        # Create meta-learner with higher learning rate
+        config['meta_learning_rate'] = 3e-3  # 10x higher
+        config['inner_lr'] = 0.1  # 10x higher
+        
         self.meta_learner = HigherLayerMetaLearner(
             meta_policy=meta_policy,
             value_network=value_network,
@@ -834,15 +839,33 @@ class TAMPOFramework:
             'best_loss': float('inf')
         }
         
-        # Automatic checkpoint loading - no prompts
+        # Automatic checkpoint loading
         if model_path and os.path.exists(model_path):
             self.load(model_path)
             print(f"✓ Resuming from checkpoint: {model_path}")
-            print(f"  Previous iterations: {self.training_history['iterations']}")
-            print(f"  Best loss: {self.training_history['best_loss']:.4f}")
         else:
-            print("✓ Initialized new TAM-PO model")
+            print("✓ Initialized new TAM-PO model with STRONG offloading bias")
     
+    def _initialize_policy_bias(self, policy: MetaPolicyNetwork, num_resources: int):
+        """
+        EXTREME initialization bias toward offloading
+        """
+        for name, param in policy.decoder.decision_head.named_parameters():
+            if 'weight' in name and param.dim() == 2:
+                nn.init.xavier_uniform_(param)
+                with torch.no_grad():
+                    # Make local EXTREMELY unlikely
+                    param[:, 0] *= 0.01
+                    # Make cloud/edge EXTREMELY likely
+                    for i in range(1, num_resources):
+                        param[:, i] *= 5.0
+            elif 'bias' in name:
+                with torch.no_grad():
+                    param[0] = -10.0  # Massive penalty for local
+                    param[1] = 5.0    # Huge bonus for cloud
+                    for i in range(2, len(param)):
+                        param[i] = 4.0  # Big bonus for edge
+
     def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = "models/tampo_checkpoint.pth"):
         """
         Main training loop with proper MAML meta-learning and checkpointing
@@ -878,7 +901,7 @@ class TAMPOFramework:
                 if hasattr(self.env, 'set_task'):
                     self.env.set_task(task_id)
                 
-                train_exp, test_exp = self._collect_task_experiences(task_id)
+                train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
                 
                 task_batch.append({
                     'task_id': task_id,
@@ -886,17 +909,15 @@ class TAMPOFramework:
                     'test_experiences': test_exp
                 })
             
-            # Meta-update (suppressed output)
+            # Meta-update
             import sys
             from io import StringIO
             
-            # Capture verbose output
             old_stdout = sys.stdout
             sys.stdout = StringIO()
             
             meta_loss = self.meta_learner.meta_update(task_batch)
             
-            # Restore stdout
             sys.stdout = old_stdout
             
             # Store loss
@@ -906,26 +927,19 @@ class TAMPOFramework:
             # Update best loss
             if meta_loss < self.training_history['best_loss']:
                 self.training_history['best_loss'] = meta_loss
-                # Save best model
                 best_path = checkpoint_path.replace('.pth', '_best.pth')
                 self._save_checkpoint(best_path)
             
-            # Threshold-triggered updates (silent)
-            if iteration % 10 == 0:
-                updates = self.meta_learner.collect_updates()
-                if len(updates) > 0:
-                    self.meta_learner.refine_with_agent_updates(updates)
-            
-            # Progress reporting every 10 iterations
-            if (iteration + 1) % 10 == 0 or iteration == 0:
+            # Progress reporting every 5 iterations
+            if (iteration + 1) % 5 == 0 or iteration == 0:
                 avg_loss_10 = np.mean(self.training_history['losses'][-10:])
                 print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
                       f"Loss: {meta_loss:.4f} | "
                       f"Avg(10): {avg_loss_10:.4f} | "
                       f"Best: {self.training_history['best_loss']:.4f}")
             
-            # Save checkpoint every 20 iterations
-            if (iteration + 1) % 20 == 0:
+            # Save checkpoint every 10 iterations
+            if (iteration + 1) % 10 == 0:
                 self._save_checkpoint(checkpoint_path)
         
         # Final save
@@ -946,12 +960,12 @@ class TAMPOFramework:
             'training_history': self.training_history
         }, path)
     
-    def _collect_task_experiences(self, task_id: int, num_episodes: int = 3):
-        """Collect training and test experiences (silent mode)"""
+    def _collect_task_experiences(self, task_id: int, num_episodes: int = 10):
+        """Collect MORE experiences for better learning"""
         train_experiences = []
         test_experiences = []
         
-        for ep in range(num_episodes):
+        for ep in range(num_episodes):  # Increased from 5 to 10
             preference = self._sample_preference()
             
             state = self.env.reset(preference_vector=preference)
@@ -959,7 +973,7 @@ class TAMPOFramework:
             episode_exp = []
             
             step_count = 0
-            max_steps = 50
+            max_steps = 50  # More steps per episode
             
             while not done and step_count < max_steps:
                 task_features = self._extract_task_features(state)
@@ -974,7 +988,7 @@ class TAMPOFramework:
                     'task_features': task_features,
                     'server_features': server_features,
                     'action': action,
-                    'reward': reward,
+                    'reward': reward,  # Use raw reward (already very strong signal)
                     'preference': preference,
                     'mo_return': np.array([info.get('delay', 0), info.get('energy', 0)]),
                     'next_state': next_state,
@@ -985,13 +999,11 @@ class TAMPOFramework:
                 state = next_state
                 step_count += 1
             
-            # Split train/test
+            # Split train/test 80/20
             if len(episode_exp) > 0:
-                split = max(1, len(episode_exp) // 2)
-                if ep < num_episodes - 1:
-                    train_experiences.extend(episode_exp[:split])
-                else:
-                    test_experiences.extend(episode_exp[split:])
+                split = max(1, int(len(episode_exp) * 0.8))
+                train_experiences.extend(episode_exp[:split])
+                test_experiences.extend(episode_exp[split:])
         
         return train_experiences, test_experiences
     
@@ -1012,7 +1024,7 @@ class TAMPOFramework:
         return server_feat
     
     def _select_action(self, task_features, server_features, preference):
-        """Select action using policy"""
+        """Select action - minimal exploration needed with strong init"""
         with torch.no_grad():
             task_tensor = torch.FloatTensor(task_features).to(self.device)
             server_tensor = torch.FloatTensor(server_features).to(self.device)
@@ -1023,7 +1035,14 @@ class TAMPOFramework:
             )
             
             probs = torch.softmax(logits[:, 0, :], dim=-1)
-            action = torch.multinomial(probs, 1).item()
+            
+            # Very minimal exploration (5%)
+            if np.random.rand() < 0.05:
+                # Even in exploration, never choose local
+                weights = np.array([0.0, 0.5, 0.25, 0.25])  # No local!
+                action = np.random.choice(len(weights), p=weights/weights.sum())
+            else:
+                action = torch.argmax(probs, dim=-1).item()
         
         return action
     

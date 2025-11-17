@@ -62,61 +62,44 @@ class ValueNetwork(nn.Module):
         return self.network(x).squeeze(-1)
 
 class PPOAgent:
-    """
-    Proximal Policy Optimization Agent for Task Offloading
-    
-    References:
-        Schulman et al., "Proximal Policy Optimization Algorithms," 2017
-        
-    Implements the PPO-Clip algorithm with:
-    - Clipped surrogate objective for policy updates
-    - Generalized Advantage Estimation (GAE)
-    - Value function loss
-    - Entropy bonus for exploration
-    - Automatic checkpointing and resume capability
-    """
+    """PPO with aggressive learning for offloading"""
     
     def __init__(self, env, config: Dict, model_path: Optional[str] = None):
-        """
-        Initialize PPO agent
-        
-        Args:
-            env: Task offloading environment
-            config: Configuration dictionary
-            model_path: Path to existing checkpoint (optional)
-        """
         self.env = env
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         print(f"🔧 Using device: {self.device}")
         
-        # Hyperparameters (from ppo.txt)
-        self.learning_rate = config.get('learning_rate', 3e-4)
-        self.gamma = config.get('gamma', 0.99)  # Discount factor
-        self.gae_lambda = config.get('gae_lambda', 0.95)  # GAE lambda
-        self.clip_epsilon = config.get('clip_epsilon', 0.2)  # Clipping parameter
-        self.value_coef = config.get('value_coef', 0.5)  # c1 in ppo.txt
-        self.entropy_coef = config.get('entropy_coef', 0.01)  # c2 in ppo.txt
-        self.max_grad_norm = config.get('max_grad_norm', 0.5)
-        self.ppo_epochs = config.get('ppo_epochs', 10)  # K epochs in ppo.txt
+        # AGGRESSIVE hyperparameters
+        self.learning_rate = config.get('learning_rate', 1e-3)  # Higher LR
+        self.gamma = config.get('gamma', 0.99)
+        self.gae_lambda = config.get('gae_lambda', 0.95)
+        self.clip_epsilon = config.get('clip_epsilon', 0.3)  # Larger clip
+        self.value_coef = config.get('value_coef', 0.5)
+        self.entropy_coef = config.get('entropy_coef', 0.001)  # Less entropy
+        self.max_grad_norm = config.get('max_grad_norm', 1.0)
+        self.ppo_epochs = config.get('ppo_epochs', 10)  # More epochs
         self.batch_size = config.get('batch_size', 64)
-        self.rollout_steps = config.get('rollout_steps', 2048)  # T steps in ppo.txt
+        self.rollout_steps = config.get('rollout_steps', 2048)
         
         # Networks
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.n
-        hidden_dims = config.get('hidden_dims', [256, 256])
+        hidden_dims = config.get('hidden_dims', [128, 128])  # Smaller/faster
         
         self.policy = PolicyNetwork(obs_dim, action_dim, hidden_dims).to(self.device)
         self.value = ValueNetwork(obs_dim, hidden_dims).to(self.device)
         
-        # Optimizer (combined for both networks)
+        # EXTREME initialization
+        self._initialize_with_bias(action_dim)
+        
+        # Optimizer
         self.optimizer = optim.Adam(
             list(self.policy.parameters()) + list(self.value.parameters()),
             lr=self.learning_rate
         )
         
-        # Storage for rollout data
+        # Storage
         self.reset_storage()
         
         # Training history
@@ -131,21 +114,32 @@ class PPOAgent:
             'best_reward': float('-inf')
         }
         
-        # Automatic checkpoint loading - no prompts
+        # Load checkpoint
         if model_path and os.path.exists(model_path):
             try:
                 self.load(model_path)
-                print(f"✓ Resuming from checkpoint: {model_path}")
-                print(f"  Previous episodes: {self.training_history['episodes']}")
-                print(f"  Best reward: {self.training_history['best_reward']:.4f}")
+                print(f"✓ Resuming from checkpoint")
             except Exception as e:
-                print(f"⚠️  Warning: Failed to load checkpoint: {e}")
-                print(f"  Starting fresh training")
+                print(f"⚠️  Starting fresh")
         else:
-            if model_path:
-                print(f"✓ No checkpoint found at {model_path}")
-            print("✓ Initialized new PPO model")
+            print("✓ Initialized PPO with EXTREME offloading bias")
     
+    def _initialize_with_bias(self, action_dim: int):
+        """EXTREME bias toward offloading"""
+        with torch.no_grad():
+            # Destroy local action completely
+            self.policy.action_head.weight[:, 0] *= 0.01
+            self.policy.action_head.bias[0] = -10.0
+            
+            # Massively boost cloud
+            self.policy.action_head.weight[:, 1] *= 5.0
+            self.policy.action_head.bias[1] = 5.0
+            
+            # Boost edges
+            for i in range(2, action_dim):
+                self.policy.action_head.weight[:, i] *= 4.0
+                self.policy.action_head.bias[i] = 4.0
+
     def reset_storage(self):
         """Reset experience storage for new rollout"""
         self.states = []
