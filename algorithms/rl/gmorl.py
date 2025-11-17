@@ -647,13 +647,13 @@ class GMORLAgent:
             # Update episode count
             self.training_history['episodes'] = current_episode + 1
             
-            # Progress reporting
+            # Progress reporting - FIX: Use scientific notation for energy
             if (episode + 1) % 10 == 0 or episode == 0:
                 avg_policy_loss = np.mean(self.training_history['policy_loss'][-100:]) if len(self.training_history['policy_loss']) > 0 else 0
                 avg_value_loss = np.mean(self.training_history['value_loss'][-100:]) if len(self.training_history['value_loss']) > 0 else 0
                 print(f"  Episode {current_episode + 1:3d}/{start_episode + num_episodes} | "
                       f"Pref: [{preference[0]:.2f}, {preference[1]:.2f}] | "
-                      f"Delay: {episode_delay:.2f}s | Energy: {episode_energy:.2f}J | "
+                      f"Delay: {episode_delay:.2f}s | Energy: {episode_energy:.6f}J | "  # Changed from .2f to .6f
                       f"Policy Loss: {avg_policy_loss:.4f} | Value Loss: {avg_value_loss:.4f} | "
                       f"Alpha: {self.alpha:.4f}")
             
