@@ -59,10 +59,10 @@ training:
   gamma: 0.99
   
   # Meta-learning
-  meta_batch_size: 5
-  num_meta_iterations: 100
+  meta_batch_size: 8
+  num_meta_iterations: 300
   inner_lr: 0.01
-  inner_steps: 10
+  inner_steps: 3
   
   # Threshold-based communication
   hypervolume_threshold: 0.7

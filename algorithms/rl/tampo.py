@@ -999,12 +999,8 @@ class TAMPOFramework:
             hidden_dim=hidden_dim
         )
         
-        # AGGRESSIVE initialization - strongly bias toward offloading
+        # Explicit decoder initialization hook.
         self._initialize_policy_bias(meta_policy, num_resources)
-        
-        # Create meta-learner with higher learning rate
-        config['meta_learning_rate'] = 3e-3  # 10x higher
-        config['inner_lr'] = 0.1  # 10x higher
         
         self.meta_learner = HigherLayerMetaLearner(
             meta_policy=meta_policy,
@@ -1032,27 +1028,20 @@ class TAMPOFramework:
             self.load(model_path)
             print(f"✓ Resuming from checkpoint: {model_path}")
         else:
-            print("✓ Initialized new TAM-PO model with STRONG offloading bias")
+            print("✓ Initialized new TAM-PO model with neutral decoder initialization")
     
     def _initialize_policy_bias(self, policy: MetaPolicyNetwork, num_resources: int):
         """
-        EXTREME initialization bias toward offloading
+        Keep decoder initialization explicit but neutral so the learned policy
+        reflects the data and preference conditioning instead of hand-crafted
+        action priors.
         """
         for name, param in policy.decoder.decision_head.named_parameters():
             if 'weight' in name and param.dim() == 2:
                 nn.init.xavier_uniform_(param)
-                with torch.no_grad():
-                    # Make local EXTREMELY unlikely
-                    param[:, 0] *= 1.0
-                    # Make cloud/edge EXTREMELY likely
-                    for i in range(1, num_resources):
-                        param[:, i] *= 5.0
             elif 'bias' in name:
                 with torch.no_grad():
-                    param[0] = 0.0  # Massive penalty for local
-                    param[1] = 0.0    # Huge bonus for cloud
-                    for i in range(2, len(param)):
-                        param[i] = 4.0  # Big bonus for edge
+                    param.zero_()
 
     def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = "models/tampo_checkpoint.pth"):
         """

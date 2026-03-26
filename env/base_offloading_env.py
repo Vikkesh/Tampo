@@ -349,60 +349,51 @@ class TaskOffloadingEnv(gym.Env):
     def _execute_offloading(self, action: int) -> Tuple[float, float]:
         """
         Execute offloading decision and return delay and energy
-        SIMPLIFIED: Make cloud/edge dramatically better than local
+        using a moderate trade-off structure suitable for algorithm comparison.
         """
         task_size = self.current_task['size']
         task_cycles = self.current_task['cycles']
         
-        if action == 0:  # Local execution - ALWAYS WORST
-            # Local is 10-20x slower than offloading
+        if action == 0:  # Local execution
             delay = task_cycles / self.local_freq
             energy = self.kappa * task_cycles * (self.local_freq ** 2)
             
-        elif action == 1:  # Cloud offloading - BEST for delay
-            # Cloud is ultra-fast with minimal transmission overhead
+        elif action == 1:  # Cloud offloading
             datarate_up = self._get_datarate(0)
-            trans_delay_up = task_size / (datarate_up * 10)  # 10x faster upload
+            trans_delay_up = task_size / max(datarate_up, 1e-9)
             
-            # Cloud computation is negligible
-            comp_delay = task_cycles / (self.cloud_freq * 20)  # 20x speedup
+            comp_delay = task_cycles / self.cloud_freq
             
-            # Download is fast
             datarate_down = self._get_datarate(0)
-            trans_delay_down = (task_size * 0.01) / (datarate_down * 10)  # Tiny result
+            trans_delay_down = (task_size * 0.05) / max(datarate_down, 1e-9)
             
             delay = trans_delay_up + comp_delay + trans_delay_down
             
-            # Energy is just transmission (very low)
-            energy = (trans_delay_up + trans_delay_down) * self.cloud_power_tx * 0.1
+            energy = (trans_delay_up + trans_delay_down) * self.cloud_power_tx
             
             self.server_loads[0] += 0.1
             
-        else:  # Edge offloading - BEST for energy, good for delay
+        else:  # Edge offloading
             edge_idx = action - 2
             if edge_idx >= len(self.edge_freq):
                 edge_idx = 0
             server_idx = edge_idx + 1
             
-            # Edge is very close - minimal transmission
-            datarate_up = self._get_datarate(server_idx) * 20  # 20x faster
-            trans_delay_up = task_size / (datarate_up * 2)
+            datarate_up = self._get_datarate(server_idx) * 1.5
+            trans_delay_up = task_size / max(datarate_up, 1e-9)
             
-            # Edge computation is fast
-            comp_delay = task_cycles / (self.edge_freq[edge_idx] * 10)  # 10x speedup
+            comp_delay = task_cycles / self.edge_freq[edge_idx]
             
-            datarate_down = self._get_datarate(server_idx) * 20
-            trans_delay_down = (task_size * 0.01) / (datarate_down * 2)
+            datarate_down = self._get_datarate(server_idx) * 1.5
+            trans_delay_down = (task_size * 0.05) / max(datarate_down, 1e-9)
             
             delay = trans_delay_up + comp_delay + trans_delay_down
             
-            # Energy is minimal (close proximity)
-            energy = (trans_delay_up + trans_delay_down) * self.edge_power_tx * 0.05
+            energy = (trans_delay_up + trans_delay_down) * self.edge_power_tx
             
             self.server_loads[server_idx] += 0.1
         
-        # Minimal load decay
-        self.server_loads *= 0.95
+        self.server_loads *= 0.98
         
         return delay, energy
     
@@ -476,7 +467,9 @@ class TaskOffloadingEnv(gym.Env):
     
     def _calculate_reward(self, delay: float, energy: float) -> float:
         """
-        EXTREMELY STRONG reward shaping - make it impossible to miss the pattern
+        Moderately shaped reward based on preference-weighted improvement over
+        local execution, clipped to keep learning stable without dictating the
+        optimal action family in advance.
         """
         # Calculate what local execution would cost
         local_delay = self.current_task['cycles'] / self.local_freq
@@ -489,24 +482,8 @@ class TaskOffloadingEnv(gym.Env):
         # Weighted improvement
         total_improvement = (self.preference[0] * delay_improvement + 
                             self.preference[1] * energy_improvement)
-        
-        # MASSIVE rewards for offloading
-        if self._last_action != 0:  # Not local
-            # Offloading gets huge base reward
-            reward = 100.0 + 100.0 * total_improvement
-            
-            # Extra bonus for cloud (delay-focused)
-            if self._last_action == 1 and self.preference[0] > 0.5:
-                reward += 50.0
-            
-            # Extra bonus for edge (energy-focused)
-            elif self._last_action > 1 and self.preference[1] > 0.5:
-                reward += 50.0
-                
-        else:  # Local execution
-            # Massive penalty for local
-            reward = -100.0 - 50.0 * (1.0 - total_improvement)
-        
+
+        reward = float(np.clip(5.0 * total_improvement, -5.0, 5.0))
         return reward
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
