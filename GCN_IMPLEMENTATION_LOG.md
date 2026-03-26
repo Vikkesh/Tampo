@@ -1,9 +1,9 @@
 # Detailed Change Log & Implementation Logic: GCN Integration
 
-This log reflects the current, corrected TAMPO graph pipeline after the GCN rework. The old version described a mathematically valid GCN kernel, but the end-to-end system was still passing flattened environment state instead of true DAG node features. That gap has now been closed.
+This log reflects the current, corrected TAMPO graph pipeline after the GCN rework. The older revision described a mathematically valid dense GCN kernel, but the end-to-end system was still passing flattened environment state instead of true DAG node features, and the implementation was not using the common graph-learning library stack. That gap has now been closed.
 
 ## Current GCN Design Standard
-The active implementation follows the Kipf-Welling style update:
+The active implementation follows the Kipf-Welling style update through **PyTorch Geometric's `GCNConv`**:
 
 $$
 X^{(l+1)} = \sigma\left(\tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2}X^{(l)}W^{(l)}\right)
@@ -12,13 +12,14 @@ $$
 with the following practical choices:
 
 * `A` is built from the DAG adjacency matrix parsed from the `.gv` file.
-* The dense adjacency is symmetrized before propagation so the native GCN behaves like the common undirected normalization used in standard GCN layers.
-* Self-loops are added every forward pass.
-* Degree normalization is applied with dense `torch.bmm` operations.
-* Variable-size graphs are padded inside the batch and accompanied by a node mask.
+* The graph is converted into PyG's `edge_index` format.
+* The DAG edge list is passed through `to_undirected(...)` so the GCN branch matches the common undirected-neighborhood assumption used by standard `GCNConv`.
+* Self-loops and degree normalization are handled inside `GCNConv`.
+* Variable-size graphs are batched with `torch_geometric.data.Batch`.
+* Node embeddings are converted back to dense form with `to_dense_batch(...)` so the rest of TAMPO can keep using attention, masking, and graph-level pooling.
 * A graph-level context vector is produced by masked pooling over encoded node states.
 
-The implementation stays in native PyTorch instead of `torch_geometric`, which keeps the project portable in environments like Colab while still matching the core GCN message-passing math.
+The implementation now uses the paper-standard GNN library path instead of manual dense matrix multiplication.
 
 ---
 
@@ -60,14 +61,14 @@ Each node now uses a 6D feature vector:
 **What changed now**
 * `DAGEncoder` now supports `encoder_type in {'lstm', 'gcn', 'both'}`.
 * Added dense graph padding and `node_mask` support for batching.
+* Added `_build_pyg_batch(...)` to convert parsed DAGs into PyG `Data`/`Batch` objects.
 * Replaced the old “1 token pretending to be a graph” path with true graph tensors.
 * Replaced the old temporary-weight-swapping MAML shortcut with a proper functional forward pass using `torch.func.functional_call`.
 * `GCN` path now:
-  * symmetrizes adjacency
-  * adds self-loops
-  * normalizes by degree
-  * applies stacked dense message-passing layers
-  * masks padded nodes after every layer
+  * converts adjacency to `edge_index`
+  * uses stacked `GCNConv` layers
+  * relies on PyG's standard self-loop and normalization behavior
+  * reconstructs dense padded node states with `to_dense_batch(...)`
 * `LSTM` path now operates over node sequences and supports padded batches via packed sequences.
 * The final graph representation is built with masked pooling over encoded node states.
 * The policy now decodes a single graph-level offloading decision from the encoded DAG instead of treating the raw flat state as if it were a node sequence.
@@ -80,7 +81,7 @@ Node feature matrix [B, N, F]
   -> task embedding
   -> one of:
        LSTM branch
-       GCN branch
+       GCN branch (PyG Batch -> GCNConv stack -> to_dense_batch)
        BOTH branch (LSTM + GCN fused)
   -> multi-head self-attention over encoded nodes
   -> masked graph pooling
@@ -97,7 +98,8 @@ Node feature matrix [B, N, F]
 * TAMPO variants save to isolated checkpoints:
   * `models/tampo_lstm_checkpoint.pth`
   * `models/tampo_gcn_checkpoint.pth`
-  * manual config support also exists for `both`
+* manual config support also exists for `both`
+* the interactive run menu now cleanly exposes `TAMPO-LSTM` and `TAMPO-GCN` as separate benchmark entries
 * Plot colors were made dynamic so more algorithms can be shown in a single results figure.
 
 ### 5. `tampo/utils/common_evaluator.py`
@@ -159,8 +161,8 @@ The current TAMPO GCN path is now a real graph encoder pipeline:
 
 * parsed DAG -> aligned adjacency
 * environment -> graph node feature matrix + adjacency + server features
-* TAMPO -> padded graph batch + node mask
-* encoder -> LSTM, GCN, or fused both
+* TAMPO -> padded dense batch + PyG graph batch + node mask
+* encoder -> LSTM, PyG `GCNConv`, or fused both
 * MAML inner loop -> functional parameter update path
 * decoder -> one graph-level offloading decision
 

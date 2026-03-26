@@ -32,22 +32,23 @@ The project categorizes its algorithms into two main types: **Heuristics** and *
 
 ---
 
-## 3. System Architecture: GCN Integration (Native PyTorch)
+## 3. System Architecture: GCN Integration (Paper-Standard PyG)
 
 To optimally handle Directed Acyclic Graph (DAG) structures, the TAMPO framework now routes parsed DAGs through a true graph-input pipeline and supports a **Graph Convolutional Network (GCN)** alongside the original **BiLSTM** encoder.
 
-### 3.1 Design Choice: Native PyTorch vs PyTorch Geometric
-The decision was made to implement the GCN using **Native PyTorch Matrix Multiplications** (`torch.bmm`) rather than relying on external libraries like `torch_geometric`. 
-* **Why?** PyTorch Geometric requires highly specific, compiled CUDA wheels (`torch-scatter`, `torch-sparse`). In dynamic environments like Google Colab or external compute clusters, this frequently leads to dependency conflicts and environment breaks. 
-* **Result:** The native approach keeps the repo lightweight while still implementing the standard normalized message-passing step directly in PyTorch.
+### 3.1 Design Choice: PyTorch Geometric (`torch_geometric`)
+The active GCN implementation now uses **PyTorch Geometric (PyG)**, which is the more common research-paper-standard library choice for graph neural networks.
+* **Why?** PyG provides tested graph layers, `edge_index` graph formatting, graph batching, and node-to-dense packing utilities that align much better with the standard GCN literature and open-source baselines.
+* **Result:** TAMPO now uses the same style of GCN stack most readers expect when they see a graph-learning paper: parsed graph -> `Data`/`Batch` -> `GCNConv` layers -> graph pooling -> decoder.
 
 ### 3.2 The Mathematical Logic
-The GCN operates using a symmetric normalized adjacency mechanism. In `tampo/algorithms/rl/tampo.py` -> `DAGEncoder._apply_gcn()`, the layer logic calculates:
+The GCN still follows the Kipf-Welling update, but the normalization and message passing are now handled by `torch_geometric.nn.GCNConv` in `tampo/algorithms/rl/tampo.py` -> `DAGEncoder._apply_gcn()`.
 
-1. **Self-Loops:** $\tilde{A} = A + I$ (Ensures a node considers its own features during the message passing phase).
-2. **Degree Matrix:** Computes the diagonal degree matrix ($\tilde{D}$) based on the edges in $\tilde{A}$.
-3. **Normalization:** Calculates the symmetrically normalized Laplacian: $\hat{A} = \tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2}$.
-4. **Forward Pass:** For each layer $l$, the hidden states are updated via the matrix operation: $H^{(l+1)} = \sigma(\hat{A} H^{(l)} W^{(l)})$.
+1. **Graph Input:** The parser provides a DAG adjacency matrix, which TAMPO converts into PyG's `edge_index` representation.
+2. **Undirected Standardization:** The DAG edges are passed through `to_undirected(...)` so the GCN branch uses the common undirected neighborhood aggregation expected by standard `GCNConv`.
+3. **Self-Loops and Normalization:** `GCNConv` applies the standard self-loop insertion and symmetric degree normalization internally.
+4. **Forward Pass:** For each layer $l$, the hidden states follow the standard GCN rule: $H^{(l+1)} = \sigma(\hat{A} H^{(l)} W^{(l)})$.
+5. **Dense Readout Bridge:** After graph convolution, `to_dense_batch(...)` reconstructs a padded `[batch, num_nodes, hidden]` tensor so the attention/pooling/decoder path can stay compatible with the rest of TAMPO.
 
 ### 3.3 The Data Plumbing Pipeline (How the Adjacency Matrix flows)
 For the maintenance team taking over, here is exactly how the graph topology now routes through the codebase. If you adapt the graph parsing or the environment in the future, **ensure this unbroken pipeline is maintained**:
@@ -64,8 +65,9 @@ For the maintenance team taking over, here is exactly how the graph topology now
    
 3. **`tampo/algorithms/rl/tampo.py` (Data Collection & Loss Computation)**:
    - Inside `_collect_task_experiences()`, the agent now collects true graph node features, server features, and adjacency from the active DAG task.
-   - `_pad_graph_batch(...)` pads graphs of different sizes and produces a `node_mask` so the encoder can batch them safely.
-   - `DAGEncoder` supports `lstm`, `gcn`, and `both`, and the policy now makes a graph-level offloading decision from the encoded DAG context.
+   - `_pad_graph_batch(...)` still pads graphs for dense components like the LSTM path and attention masking.
+   - `_build_pyg_batch(...)` converts each DAG into a PyG `Data` object and merges them into a batched `Batch`, which is the active GCN input path.
+   - `DAGEncoder` supports `lstm`, `gcn`, and `both`, where the GCN branch now uses stacked `GCNConv` layers instead of manual dense adjacency multiplication.
    - `TAMPOFramework.select_action(...)` is graph-aware and is reused during evaluation.
    - The MAML inner loop now uses `torch.func.functional_call`, which keeps the meta-gradient chain intact across the adaptation step and makes the TAMPO meta-update closer to standard functional MAML practice.
 
@@ -82,8 +84,9 @@ In `configs/default_config.yaml`, locate the `tampo` block:
 ```
 
 ### 3.5 Operational Gotchas & Future-Proofing
-* **Graph Sizes & Batching:** The current TAMPO path now pads variable-size graphs into dense batches and carries a `node_mask`, which is safer than the earlier fixed-size-only stack.
+* **Graph Sizes & Batching:** The current TAMPO path uses both padded dense tensors and PyG graph batches. Dense padding is used for the LSTM/attention bridge, while the actual GCN layers consume PyG's sparse-style graph representation.
 * **Fallbacks:** If independent non-DAG tasks are passed, TAMPO falls back to a single-node identity graph so the policy path stays valid.
+* **Dependency Requirement:** The GCN path now expects `torch-geometric` in the runtime environment. Since this repo may be edited locally but trained in Colab, install the graph dependencies in Colab rather than manually on the local editing machine.
 * **PyTorch Requirement for TAMPO Meta-Learning:** The corrected MAML path relies on `torch.func.functional_call`, so TAMPO's meta-learning code expects a modern PyTorch version with `torch.func` support.
 
 ## 4. Testing & Exploration Guide (How to Run)
@@ -102,7 +105,57 @@ python3 main.py
 ```
 
 ### 4.2 Interactive Options & When to Use Them
-Upon execution, the script will prompt you with a series of `yes/no` questions. As the developer maintaining this system, here is a detailed breakdown of what each option does and exactly when you should select it.
+Upon execution, `main.py` presents an interactive run menu. This is the current operator-facing control surface for the project, so when new algorithms are added, this section should be kept in sync with `get_user_input()`.
+
+### 4.2A Running "Both" TAMPO Encodings
+There are now **two different meanings** of "both" for TAMPO, and it is important not to mix them up:
+
+1. **Run both benchmark variants side-by-side in one interactive session**
+   * This is the normal benchmarking workflow.
+   * Start the program with `%run tampo/main.py` in Colab or `python3 main.py` inside `tampo/`.
+   * When prompted, answer:
+     * `Run TAMPO-LSTM?` -> `yes`
+     * `Run TAMPO-GCN?` -> `yes`
+   * Then enter one shared value for `Number of meta-iterations for TAMPO`.
+   * Result: the framework trains and evaluates **two separate TAMPO runs**, one with `encoder_type='lstm'` and one with `encoder_type='gcn'`.
+   * These are saved independently and reported independently as `TAMPO_LSTM` and `TAMPO_GCN`.
+
+2. **Run the internal fused encoder mode**
+   * This is the experimental hybrid mode inside one TAMPO model.
+   * It is **not exposed in the interactive prompt menu**.
+   * To use it, set `encoder_type: 'both'` in the TAMPO config file and run TAMPO through code/config rather than the side-by-side prompt flow.
+   * Result: one TAMPO model uses both the LSTM stream and GCN stream together inside the same `DAGEncoder`.
+
+### 4.2B Important Variables, Paths, and Control Points
+If you want to quickly change how TAMPO runs, these are the most important places:
+
+* **Interactive yes/no prompts:** [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L39)
+  * `algorithms['TAMPO_LSTM']` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L76)
+  * `algorithms['TAMPO_GCN']` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L79)
+  * `algorithms['tampo_iterations']` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L100)
+  * `algorithms['eval_episodes']` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L107)
+
+* **Where the chosen TAMPO variant is actually launched:** [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L459)
+  * `TAMPO_LSTM` calls `test_tampo(..., encoder_type='lstm')` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L459)
+  * `TAMPO_GCN` calls `test_tampo(..., encoder_type='gcn')` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L468)
+
+* **Where TAMPO turns that choice into a real encoder config:** [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L234)
+  * `tampo_config['encoder_type'] = encoder_type` in [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L239)
+
+* **Default TAMPO config file:** [default_config.yaml](/home/vikkesh/Tampo-clone/tampo/configs/default_config.yaml#L95)
+  * `config['algorithms']['tampo']['encoder_type']` is documented in [default_config.yaml](/home/vikkesh/Tampo-clone/tampo/configs/default_config.yaml#L99)
+  * valid values are `'lstm'`, `'gcn'`, and `'both'`
+
+* **Checkpoint files per exposed encoder run:**
+  * `models/tampo_lstm_checkpoint.pth` created from [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L242)
+  * `models/tampo_gcn_checkpoint.pth` created from [main.py](/home/vikkesh/Tampo-clone/tampo/main.py#L242)
+
+* **Where the encoder implementation lives:** [tampo.py](/home/vikkesh/Tampo-clone/tampo/algorithms/rl/tampo.py#L64)
+  * `DAGEncoder`
+  * `encoder_type`
+  * `_build_pyg_batch(...)`
+  * `_apply_gcn(...)`
+  * `_apply_lstm(...)`
 
 #### Group A: Heuristic Baselines (HEFT, PSO, GA)
 *   **Run HEFT? (Heterogeneous Earliest Finish Time)**
@@ -120,9 +173,15 @@ Upon execution, the script will prompt you with a series of `yes/no` questions. 
 *   **Run GMORL? (Generalized Multi-Objective RL)**
     *   *Goal:* Optimizes heavily for the Pareto front (Delay vs. Energy) using a Histogram Encoder.
     *   *When to choose:* Select this when your current sprint/focus is specifically on tuning multi-objective trade-offs (e.g., punishing power consumption) rather than pure offloading latency.
-*   **Run TAMPO-LSTM? / Run TAMPO-GCN?**
-    *   *Goal:* These are the two exposed TAMPO benchmark variants. They share the same graph input pipeline but use different encoders internally.
-    *   *When to choose:* Select one when validating a single encoder family, or select both when you want a direct side-by-side benchmark from a single interactive run.
+*   **Run TAMPO-LSTM?**
+    *   *Goal:* Runs the TAMPO meta-RL pipeline with the sequence-oriented BiLSTM encoder over topologically ordered node features.
+    *   *When to choose:* Use this when you want the non-GNN structural baseline inside TAMPO, or when you want to compare sequence modeling versus graph convolution using the same downstream decoder and MAML loop.
+*   **Run TAMPO-GCN?**
+    *   *Goal:* Runs the TAMPO meta-RL pipeline with the paper-standard PyG `GCNConv` encoder over the parsed DAG graph.
+    *   *When to choose:* Use this when your experiment specifically targets graph neural scheduling quality, or when you want the architecture most aligned with standard GCN literature.
+*   **Internal `encoder_type: both` option**
+    *   *Goal:* Fuses the LSTM stream and the GCN stream inside the same `DAGEncoder`.
+    *   *When to choose:* This is currently a config-only option for internal experiments. It is not exposed in the interactive prompt menu, which keeps the main benchmarking workflow easier to compare and report.
 
 ### 4.3 Training & Evaluation Parameters
 After selecting the RL algorithms, you will be prompted for duration parameters:

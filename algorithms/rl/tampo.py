@@ -5,6 +5,9 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
 from torch.func import functional_call
+from torch_geometric.data import Batch, Data
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import to_dense_batch, to_undirected
 from collections import deque
 import copy
 import os
@@ -34,6 +37,29 @@ def _pad_graph_batch(
         adj_batch[idx, :num_nodes, :num_nodes] = adj
 
     return task_batch, adj_batch, node_mask
+
+def _build_pyg_batch(
+    task_features_list: List[np.ndarray],
+    adjacency_list: Optional[List[np.ndarray]] = None
+) -> Batch:
+    """Build a PyG batch using edge_index, which is the standard GCN input format."""
+    data_list = []
+
+    for idx, features in enumerate(task_features_list):
+        x = torch.as_tensor(features, dtype=torch.float32)
+        num_nodes = x.size(0)
+
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        if adjacency_list is not None and adjacency_list[idx] is not None:
+            adj = torch.as_tensor(adjacency_list[idx], dtype=torch.float32)
+            edge_positions = torch.nonzero(adj > 0, as_tuple=False)
+            if edge_positions.numel() > 0:
+                edge_index = edge_positions.t().contiguous().long()
+                edge_index = to_undirected(edge_index, num_nodes=num_nodes)
+
+        data_list.append(Data(x=x, edge_index=edge_index, num_nodes=num_nodes))
+
+    return Batch.from_data_list(data_list)
 
 class DAGEncoder(nn.Module):
     """
@@ -71,7 +97,7 @@ class DAGEncoder(nn.Module):
             )
         if self.encoder_type in {'gcn', 'both'}:
             self.gcn_layers = nn.ModuleList([
-                nn.Linear(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2) 
+                GCNConv(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2)
                 for i in range(num_layers)
             ])
         if self.encoder_type not in {'lstm', 'gcn', 'both'}:
@@ -117,44 +143,33 @@ class DAGEncoder(nn.Module):
         )
         return out
 
-    def _apply_gcn(self, x, adj, node_mask=None):
-        """Dense GCN over a padded adjacency batch."""
-        batch_size, num_tasks, _ = x.shape
-        if adj is None:
-            adj = torch.eye(num_tasks).unsqueeze(0).repeat(batch_size, 1, 1).to(x.device)
+    def _apply_gcn(self, graph_batch, max_num_nodes: int):
+        """PyG GCN stack using the paper-standard edge_index graph format."""
+        if graph_batch is None:
+            raise ValueError("graph_batch is required for GCN-based encoders")
 
-        adj = adj.float()
-        adj = torch.maximum(adj, adj.transpose(1, 2))
+        x = self.task_embedding(graph_batch.x)
+        edge_index = graph_batch.edge_index
 
-        if node_mask is not None:
-            valid_pairs = node_mask.unsqueeze(1).float() * node_mask.unsqueeze(2).float()
-            adj = adj * valid_pairs
-
-        eye = torch.eye(num_tasks, device=x.device).unsqueeze(0).expand(batch_size, -1, -1)
-        if node_mask is not None:
-            eye = eye * node_mask.unsqueeze(-1).float()
-        adj_self = adj + eye
-
-        degree = adj_self.sum(dim=-1).clamp(min=1e-6)
-        d_inv_sqrt = torch.diag_embed(torch.pow(degree, -0.5))
-        norm_adj = torch.bmm(torch.bmm(d_inv_sqrt, adj_self), d_inv_sqrt)
-        
         for i, layer in enumerate(self.gcn_layers):
-            support = layer(x)
-            x = torch.bmm(norm_adj, support)
+            x = layer(x, edge_index)
             if i < len(self.gcn_layers) - 1:
                 x = self.dropout(torch.relu(x))
-            if node_mask is not None:
-                x = x * node_mask.unsqueeze(-1).float()
-                
-        return x
 
-    def forward(self, task_features, adjacency_matrix=None, node_mask=None):
+        dense_x, node_mask = to_dense_batch(
+            x,
+            graph_batch.batch,
+            max_num_nodes=max_num_nodes
+        )
+        return dense_x, node_mask
+
+    def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None):
         """
         Args:
             task_features: [batch, num_tasks, feature_dim]
             adjacency_matrix: [batch, num_tasks, num_tasks] optional
             node_mask: [batch, num_tasks] optional
+            graph_batch: PyG Batch for GCN-based encoders
         
         Returns:
             encoded_tasks: [batch, num_tasks, hidden_dim * 2]
@@ -168,7 +183,10 @@ class DAGEncoder(nn.Module):
         if self.encoder_type in {'lstm', 'both'}:
             encoded_streams.append(self._apply_lstm(embedded, node_mask))
         if self.encoder_type in {'gcn', 'both'}:
-            encoded_streams.append(self._apply_gcn(embedded, adjacency_matrix, node_mask))
+            gcn_out, gcn_mask = self._apply_gcn(graph_batch, task_features.size(1))
+            if node_mask is None:
+                node_mask = gcn_mask
+            encoded_streams.append(gcn_out)
 
         if self.encoder_type == 'both':
             out = self.hybrid_fusion(torch.cat(encoded_streams, dim=-1))
@@ -320,12 +338,18 @@ class MetaPolicyNetwork(nn.Module):
         preference,
         num_decisions: int = 1,
         adjacency=None,
-        node_mask=None
+        node_mask=None,
+        graph_batch=None
     ):
         """
         Forward pass
         """
-        encoded_tasks, context = self.encoder(task_features, adjacency, node_mask)
+        encoded_tasks, context = self.encoder(
+            task_features,
+            adjacency,
+            node_mask,
+            graph_batch=graph_batch
+        )
         
         server_encoded = self.server_encoder(server_features)
         combined_context = context + server_encoded
@@ -491,21 +515,30 @@ class LowerLayerAgent:
     def _prepare_policy_batch(
         self,
         batch: List[Dict]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Pad graph batches and convert them to tensors."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Batch]:
+        """Pad graph batches for dense paths and build a PyG batch for GCN paths."""
+        task_features_list = [
+            np.asarray(exp['task_features'], dtype=np.float32) for exp in batch
+        ]
+        adjacency_list = [
+            np.asarray(exp.get('adj_matrix'), dtype=np.float32)
+            if exp.get('adj_matrix') is not None else None
+            for exp in batch
+        ]
         task_features_np, adjacency_np, node_mask_np = _pad_graph_batch(
-            [np.asarray(exp['task_features'], dtype=np.float32) for exp in batch],
-            [np.asarray(exp.get('adj_matrix'), dtype=np.float32) if exp.get('adj_matrix') is not None else None for exp in batch]
+            task_features_list,
+            adjacency_list
         )
         task_features = torch.FloatTensor(task_features_np).to(self.device)
         adjacency = torch.FloatTensor(adjacency_np).to(self.device)
         node_mask = torch.BoolTensor(node_mask_np.astype(bool)).to(self.device)
+        graph_batch = _build_pyg_batch(task_features_list, adjacency_list).to(self.device)
 
         server_features = torch.FloatTensor(
             np.array([exp['server_features'] for exp in batch], dtype=np.float32)
         ).to(self.device)
 
-        return task_features, server_features, adjacency, node_mask
+        return task_features, server_features, adjacency, node_mask, graph_batch
 
     def _forward_with_params(
         self,
@@ -515,7 +548,8 @@ class LowerLayerAgent:
         preference,
         num_decisions: int = 1,
         adjacency=None,
-        node_mask=None
+        node_mask=None,
+        graph_batch=None
     ):
         """
         Forward pass using specific parameters (for functional gradient computation)
@@ -530,7 +564,8 @@ class LowerLayerAgent:
             {
                 'num_decisions': num_decisions,
                 'adjacency': adjacency,
-                'node_mask': node_mask
+                'node_mask': node_mask,
+                'graph_batch': graph_batch
             }
         )
 
@@ -604,7 +639,7 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        task_features, server_features, adjacency, node_mask = self._prepare_policy_batch(batch)
+        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
@@ -618,7 +653,8 @@ class LowerLayerAgent:
             preferences,
             num_decisions=1,
             adjacency=adjacency,
-            node_mask=node_mask
+            node_mask=node_mask,
+            graph_batch=graph_batch
         )
         
         # Policy loss
@@ -650,7 +686,7 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        task_features, server_features, adjacency, node_mask = self._prepare_policy_batch(batch)
+        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
@@ -663,7 +699,8 @@ class LowerLayerAgent:
             preferences,
             num_decisions=1,
             adjacency=adjacency,
-            node_mask=node_mask
+            node_mask=node_mask,
+            graph_batch=graph_batch
         )
         
         # Policy loss
@@ -1232,6 +1269,10 @@ class TAMPOFramework:
             if adj_matrix is None:
                 adj_matrix = np.eye(task_features.shape[0], dtype=np.float32)
             adj_tensor = torch.FloatTensor(adj_matrix).unsqueeze(0).to(self.device)
+            graph_batch = _build_pyg_batch(
+                [np.asarray(task_features, dtype=np.float32)],
+                [np.asarray(adj_matrix, dtype=np.float32)]
+            ).to(self.device)
             
             logits = self.agents[0].meta_policy(
                 task_tensor,
@@ -1239,7 +1280,8 @@ class TAMPOFramework:
                 pref_tensor,
                 num_decisions=1,
                 adjacency=adj_tensor,
-                node_mask=node_mask
+                node_mask=node_mask,
+                graph_batch=graph_batch
             )
             
             probs = torch.softmax(logits[:, 0, :], dim=-1)

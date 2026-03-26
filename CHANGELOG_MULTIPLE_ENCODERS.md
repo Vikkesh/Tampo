@@ -64,6 +64,15 @@ The simultaneous encoder feature now also benefits from the corrected TAMPO MAML
 * `TAMPO_GCN` uses a proper functional MAML inner loop
 * both variants now compare encoder behavior on top of the same meta-learning logic, rather than on top of the old approximation
 
+### 2G. Paper-Standard GCN Library Path
+The `TAMPO_GCN` branch now uses `torch_geometric.nn.GCNConv` instead of the earlier native dense adjacency multiplication.
+
+That means:
+
+* `TAMPO_LSTM` remains the sequence-encoder baseline
+* `TAMPO_GCN` now runs through PyG `Data`/`Batch` graph objects and `edge_index`
+* the side-by-side comparison is now closer to what readers expect from a standard GCN benchmark
+
 ---
 
 ## 3. Why This Is Safe
@@ -73,6 +82,7 @@ The simultaneous encoder feature now also benefits from the corrected TAMPO MAML
 3. The evaluator stores results under distinct keys like `TAMPO_LSTM` and `TAMPO_GCN`, which makes the output tables, JSON, and plots naturally separate the two variants.
 4. The environment now preserves the selected DAG properly during TAMPO evaluation, so both variants are evaluated on real graph inputs instead of silently reverting to random scalar tasks.
 5. The functional MAML path keeps the meta-gradient chain intact for both encoder variants, so the comparison is not biased by the old temporary-parameter workaround.
+6. The GCN variant now uses the standard PyG graph-convolution stack instead of a custom dense kernel, which makes the LSTM-vs-GCN comparison cleaner for reporting.
 
 ---
 

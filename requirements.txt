@@ -7,6 +7,10 @@ gym>=0.26.0
 networkx>=2.8.0
 pydotplus>=2.0.2
 graphviz>=0.20.0
+torch-geometric>=2.7.0
+
+# Install graph dependencies in the target runtime (for example Colab).
+# Do not manually install them on the local device just for editing this repo.
 
 # Configuration and utilities
 pyyaml>=6.0.0
@@ -21,4 +25,3 @@ tqdm>=4.64.0
 # Development
 pytest>=7.0.0
 black>=22.0.0
-
