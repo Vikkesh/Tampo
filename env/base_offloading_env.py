@@ -5,6 +5,31 @@ from gym import spaces
 from typing import Dict, List, Tuple, Optional
 import json
 
+
+def _coerce_float(value, default: float) -> float:
+    """Convert config scalars that may arrive as YAML strings into floats."""
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _coerce_float_list(values, default: List[float]) -> List[float]:
+    """Convert config sequences that may contain YAML string numerics into floats."""
+    if values is None:
+        return [float(v) for v in default]
+
+    if not isinstance(values, (list, tuple)):
+        return [float(v) for v in default]
+
+    coerced = []
+    for idx, item in enumerate(values):
+        fallback = default[idx] if idx < len(default) else default[-1]
+        coerced.append(_coerce_float(item, fallback))
+    return coerced
+
 class TaskOffloadingEnv(gym.Env):
     """
     Unified Task Offloading Environment for comparing different algorithms.
@@ -30,24 +55,36 @@ class TaskOffloadingEnv(gym.Env):
         self.max_steps = config.get('max_steps', 100)
         
         # Computing resources
-        self.cloud_freq = config.get('cloud_freq', 10e9)  # Hz
-        self.edge_freq = np.array(config.get('edge_freq', [5e9] * self.num_edge_servers))
-        self.local_freq = config.get('local_freq', 1e9)  # Hz
+        self.cloud_freq = _coerce_float(config.get('cloud_freq', 10e9), 10e9)  # Hz
+        self.edge_freq = np.array(
+            _coerce_float_list(
+                config.get('edge_freq', [5e9] * self.num_edge_servers),
+                [5e9] * self.num_edge_servers
+            ),
+            dtype=np.float64
+        )
+        self.local_freq = _coerce_float(config.get('local_freq', 1e9), 1e9)  # Hz
         
         # Energy parameters
-        self.cloud_power_tx = config.get('cloud_power_tx', 0.5)  # Watts
-        self.edge_power_tx = config.get('edge_power_tx', 0.3)  # Watts
-        self.local_power = config.get('local_power', 0.1)  # Watts
-        self.kappa = config.get('kappa', 1e-28)  # Effective switched capacitance
+        self.cloud_power_tx = _coerce_float(config.get('cloud_power_tx', 0.5), 0.5)  # Watts
+        self.edge_power_tx = _coerce_float(config.get('edge_power_tx', 0.3), 0.3)  # Watts
+        self.local_power = _coerce_float(config.get('local_power', 0.1), 0.1)  # Watts
+        self.kappa = _coerce_float(config.get('kappa', 1e-28), 1e-28)  # Effective switched capacitance
         
         # Network parameters
-        self.bandwidth_up = config.get('bandwidth_up', 20e6)  # Hz
-        self.bandwidth_down = config.get('bandwidth_down', 20e6)  # Hz
-        self.noise_power = config.get('noise_power', 1e-13)  # Watts
+        self.bandwidth_up = _coerce_float(config.get('bandwidth_up', 20e6), 20e6)  # Hz
+        self.bandwidth_down = _coerce_float(config.get('bandwidth_down', 20e6), 20e6)  # Hz
+        self.noise_power = _coerce_float(config.get('noise_power', 1e-13), 1e-13)  # Watts
         
         # Task parameters
-        self.task_size_range = config.get('task_size_range', [1e6, 10e6])  # bits
-        self.task_cycles_range = config.get('task_cycles_range', [1e9, 10e9])  # cycles
+        self.task_size_range = _coerce_float_list(
+            config.get('task_size_range', [1e6, 10e6]),
+            [1e6, 10e6]
+        )  # bits
+        self.task_cycles_range = _coerce_float_list(
+            config.get('task_cycles_range', [1e9, 10e9]),
+            [1e9, 10e9]
+        )  # cycles
         
         # State and action spaces
         self.num_servers = self.num_edge_servers + 1  # edge servers + cloud

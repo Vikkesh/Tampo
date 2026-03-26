@@ -130,14 +130,17 @@ class DAGEncoder(nn.Module):
     def _apply_lstm(self, x, node_mask=None):
         """BiLSTM sequence encoder over topologically ordered node features."""
         if node_mask is None:
-            out, _ = self.lstm(x)
+            # CuDNN LSTM kernels do not support the double backward needed by MAML.
+            with torch.backends.cudnn.flags(enabled=False):
+                out, _ = self.lstm(x)
             return out
 
         lengths = node_mask.sum(dim=1).clamp(min=1).to(dtype=torch.int64).cpu()
         packed = nn.utils.rnn.pack_padded_sequence(
             x, lengths, batch_first=True, enforce_sorted=False
         )
-        packed_out, _ = self.lstm(packed)
+        with torch.backends.cudnn.flags(enabled=False):
+            packed_out, _ = self.lstm(packed)
         out, _ = nn.utils.rnn.pad_packed_sequence(
             packed_out, batch_first=True, total_length=x.size(1)
         )
@@ -826,50 +829,56 @@ class HigherLayerMetaLearner:
         """
         meta_loss = 0.0
         valid_tasks = 0
+        encoder_type = getattr(self.meta_policy.encoder, 'encoder_type', 'lstm')
         
         # Zero gradients before meta-update
         self.meta_optimizer.zero_grad()
-        
-        for task_data in task_batch:
-            if len(task_data['test_experiences']) == 0:
-                continue
-            
-            # Create temporary agent sharing meta-policy reference
-            temp_agent = LowerLayerAgent(
-                agent_id=-1,
-                meta_policy=self.meta_policy,
-                value_network=self.value_network,
-                config=self.config,
-                device=self.device
-            )
-            
-            # Inner loop adaptation with gradient graph creation
-            adapted_params = None
-            if len(task_data['train_experiences']) > 0:
-                adapted_params = temp_agent.inner_loop_update(
-                    task_data['train_experiences'],
-                    num_steps=self.config.get('inner_steps', 3),
-                    create_graph=True  # CRITICAL: Enables second-order gradients
+
+        # CuDNN-backed RNN kernels do not support the second-order gradients
+        # required by MAML. Guard the whole meta-update so every LSTM forward
+        # participating in this graph uses the autograd-compatible backend.
+        cudnn_enabled = encoder_type not in {'lstm', 'both'}
+        with torch.backends.cudnn.flags(enabled=cudnn_enabled):
+            for task_data in task_batch:
+                if len(task_data['test_experiences']) == 0:
+                    continue
+                
+                # Create temporary agent sharing meta-policy reference
+                temp_agent = LowerLayerAgent(
+                    agent_id=-1,
+                    meta_policy=self.meta_policy,
+                    value_network=self.value_network,
+                    config=self.config,
+                    device=self.device
                 )
+                
+                # Inner loop adaptation with gradient graph creation
+                adapted_params = None
+                if len(task_data['train_experiences']) > 0:
+                    adapted_params = temp_agent.inner_loop_update(
+                        task_data['train_experiences'],
+                        num_steps=self.config.get('inner_steps', 3),
+                        create_graph=True  # CRITICAL: Enables second-order gradients
+                    )
+                
+                # Compute test loss with adapted parameters
+                if len(task_data['test_experiences']) > 0 and adapted_params is not None:
+                    test_loss = temp_agent._compute_loss_with_params(
+                        adapted_params,
+                        task_data['test_experiences']
+                    )
+                    meta_loss = meta_loss + test_loss
+                    valid_tasks += 1
             
-            # Compute test loss with adapted parameters
-            if len(task_data['test_experiences']) > 0 and adapted_params is not None:
-                test_loss = temp_agent._compute_loss_with_params(
-                    adapted_params,
-                    task_data['test_experiences']
-                )
-                meta_loss = meta_loss + test_loss
-                valid_tasks += 1
-        
-        if valid_tasks == 0:
-            print("WARNING: No valid tasks for meta-update!")
-            return 0.0
-        
-        # Average meta-loss across tasks
-        meta_loss = meta_loss / valid_tasks
-        
-        # Backpropagate through entire computation graph
-        meta_loss.backward()
+            if valid_tasks == 0:
+                print("WARNING: No valid tasks for meta-update!")
+                return 0.0
+            
+            # Average meta-loss across tasks
+            meta_loss = meta_loss / valid_tasks
+            
+            # Backpropagate through entire computation graph
+            meta_loss.backward()
         
         # Check if gradients are flowing properly
         print("\n=== Meta-Gradient Check ===")
@@ -1034,14 +1043,14 @@ class TAMPOFramework:
                 nn.init.xavier_uniform_(param)
                 with torch.no_grad():
                     # Make local EXTREMELY unlikely
-                    param[:, 0] *= 0.01
+                    param[:, 0] *= 1.0
                     # Make cloud/edge EXTREMELY likely
                     for i in range(1, num_resources):
                         param[:, i] *= 5.0
             elif 'bias' in name:
                 with torch.no_grad():
-                    param[0] = -10.0  # Massive penalty for local
-                    param[1] = 5.0    # Huge bonus for cloud
+                    param[0] = 0.0  # Massive penalty for local
+                    param[1] = 0.0    # Huge bonus for cloud
                     for i in range(2, len(param)):
                         param[i] = 4.0  # Big bonus for edge
 
@@ -1058,71 +1067,77 @@ class TAMPOFramework:
         print(f"  Inner LR: {self.config.get('inner_lr', 0.01)}")
         print(f"  Meta LR: {self.config.get('meta_learning_rate', 1e-4)}")
         print(f"{'='*60}\n")
+
+        cudnn_enabled = not (self.encoder_type in {'lstm', 'both'} and self.device.type == 'cuda')
+        if not cudnn_enabled:
+            print("  CuDNN disabled for TAMPO LSTM-style meta-training to support second-order gradients.")
         
-        # Create checkpoint directory
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        
-        start_iter = self.training_history['iterations']
-        
-        for iteration in range(num_iterations):
-            current_iter = start_iter + iteration
+        with torch.backends.cudnn.flags(enabled=cudnn_enabled):
+            # Create checkpoint directory
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
             
-            # Sample tasks
-            if hasattr(self.env, 'sample_tasks'):
-                task_ids = self.env.sample_tasks(meta_batch_size)
-            else:
-                task_ids = list(range(min(meta_batch_size, 10)))
+            start_iter = self.training_history['iterations']
             
-            task_batch = []
-            
-            # Collect experiences (silent mode)
-            for task_id in task_ids:
-                if hasattr(self.env, 'set_task'):
-                    self.env.set_task(task_id)
+            for iteration in range(num_iterations):
+                current_iter = start_iter + iteration
                 
-                train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
+                # Sample tasks
+                if hasattr(self.env, 'sample_tasks'):
+                    task_ids = self.env.sample_tasks(meta_batch_size)
+                else:
+                    task_ids = list(range(min(meta_batch_size, 10)))
                 
-                task_batch.append({
-                    'task_id': task_id,
-                    'train_experiences': train_exp,
-                    'test_experiences': test_exp
-                })
+                task_batch = []
+                
+                # Collect experiences (silent mode)
+                for task_id in task_ids:
+                    if hasattr(self.env, 'set_task'):
+                        self.env.set_task(task_id)
+                    
+                    train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
+                    
+                    task_batch.append({
+                        'task_id': task_id,
+                        'train_experiences': train_exp,
+                        'test_experiences': test_exp
+                    })
+                
+                # Meta-update
+                import sys
+                from io import StringIO
+                
+                old_stdout = sys.stdout
+                sys.stdout = StringIO()
+                
+                meta_loss = self.meta_learner.meta_update(task_batch)
+                
+                sys.stdout = old_stdout
+                
+                # Store loss
+                self.training_history['losses'].append(meta_loss)
+                self.training_history['iterations'] = current_iter + 1
+                
+                # Update best loss
+                if meta_loss < self.training_history['best_loss']:
+                    self.training_history['best_loss'] = meta_loss
+                    best_path = checkpoint_path.replace('.pth', '_best.pth')
+                    self._save_checkpoint(best_path)
+                
+                # Progress reporting every 5 iterations
+                if (iteration + 1) % 5 == 0 or iteration == 0:
+                    avg_loss_10 = np.mean(self.training_history['losses'][-10:])
+                    print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
+                          f"Loss: {meta_loss:.4f} | "
+                          f"Avg(10): {avg_loss_10:.4f} | "
+                          f"Best: {self.training_history['best_loss']:.4f}")
+                
+                # Save checkpoint every 10 iterations
+                if (iteration + 1) % 10 == 0:
+                    self._save_checkpoint(checkpoint_path)
             
-            # Meta-update
-            import sys
-            from io import StringIO
-            
-            old_stdout = sys.stdout
-            sys.stdout = StringIO()
-            
-            meta_loss = self.meta_learner.meta_update(task_batch)
-            
-            sys.stdout = old_stdout
-            
-            # Store loss
-            self.training_history['losses'].append(meta_loss)
-            self.training_history['iterations'] = current_iter + 1
-            
-            # Update best loss
-            if meta_loss < self.training_history['best_loss']:
-                self.training_history['best_loss'] = meta_loss
-                best_path = checkpoint_path.replace('.pth', '_best.pth')
-                self._save_checkpoint(best_path)
-            
-            # Progress reporting every 5 iterations
-            if (iteration + 1) % 5 == 0 or iteration == 0:
-                avg_loss_10 = np.mean(self.training_history['losses'][-10:])
-                print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
-                      f"Loss: {meta_loss:.4f} | "
-                      f"Avg(10): {avg_loss_10:.4f} | "
-                      f"Best: {self.training_history['best_loss']:.4f}")
-            
-            # Save checkpoint every 10 iterations
-            if (iteration + 1) % 10 == 0:
-                self._save_checkpoint(checkpoint_path)
-        
-        # Final save
-        self._save_checkpoint(checkpoint_path)
+            # Final save
+            self._save_checkpoint(checkpoint_path)
+
         print(f"\n✓ Training complete!")
         print(f"  Total iterations: {self.training_history['iterations']}")
         print(f"  Final loss: {meta_loss:.4f}")

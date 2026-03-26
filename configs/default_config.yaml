@@ -7,9 +7,9 @@ system:
   
 # Computing Resources
 computing:
-  cloud_freq: 10.0e9  # Hz
-  edge_freq: [5.0e9, 5.0e9, 5.0e9]  # Hz per server
-  local_freq: 1.0e9  # Hz
+  cloud_freq: 10000000000.0  # Hz
+  edge_freq: [5000000000.0, 5000000000.0, 5000000000.0]  # Hz per server
+  local_freq: 1000000000.0  # Hz
   
   # CPU cycles per bit
   cloud_cycles_per_bit: 1000
@@ -25,8 +25,8 @@ energy:
 
 # Network Parameters
 network:
-  bandwidth_up: 20.0e6  # Hz
-  bandwidth_down: 20.0e6  # Hz
+  bandwidth_up: 20000000.0  # Hz
+  bandwidth_down: 20000000.0  # Hz
   noise_power: 1.0e-13  # Watts
   
   # Rayleigh fading parameters
@@ -39,8 +39,8 @@ network:
 
 # Task Parameters
 tasks:
-  task_size_range: [1.0e6, 10.0e6]  # bits
-  task_cycles_range: [1.0e9, 10.0e9]  # cycles
+  task_size_range: [1000000.0, 10000000.0]  # bits
+  task_cycles_range: [1000000000.0, 10000000000.0]  # cycles
   task_type: 'dag'  # 'dag' or 'independent'
   
   # DAG task parameters
