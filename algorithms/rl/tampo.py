@@ -1049,8 +1049,8 @@ class TAMPOFramework:
                         param[:, i] *= 5.0
             elif 'bias' in name:
                 with torch.no_grad():
-                    param[0] = 0.0  # Massive penalty for local
-                    param[1] = 0.0    # Huge bonus for cloud
+                    param[0] = -10.0  # Massive penalty for local
+                    param[1] = 5.0    # Huge bonus for cloud
                     for i in range(2, len(param)):
                         param[i] = 4.0  # Big bonus for edge
 
