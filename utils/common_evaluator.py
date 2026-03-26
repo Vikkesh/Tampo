@@ -1,6 +1,5 @@
 import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
-import torch
 
 class CommonEvaluator:
     """
@@ -125,6 +124,13 @@ class CommonEvaluator:
                 episode_idx = pref_idx * episodes_per_pref + episode
                 np.random.seed(self.eval_seeds[episode_idx])
                 
+                if agent_type == 'tampo' and len(getattr(self.env, 'task_dataset', [])) > 0:
+                    task_id = episode_idx % len(self.env.task_dataset)
+                    if hasattr(self.env, 'set_task'):
+                        self.env.set_task(task_id)
+                elif hasattr(self.env, 'clear_task_selection'):
+                    self.env.clear_task_selection()
+                
                 # Reset environment with preference
                 state = self.env.reset(preference_vector=preference)
                 
@@ -182,25 +188,7 @@ class CommonEvaluator:
             return action
             
         elif agent_type == 'tampo':
-            # TAM-PO: use fully deterministic argmax
-            task_features = self._extract_task_features(state)
-            server_features = self._extract_server_features(state)
-            
-            with torch.no_grad():
-                device = agent.device
-                task_tensor = torch.FloatTensor(task_features).to(device)
-                server_tensor = torch.FloatTensor(server_features).to(device)
-                pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(device)
-                
-                logits = agent.meta_learner.meta_policy(
-                    task_tensor, server_tensor, pref_tensor, num_tasks=1
-                )
-                
-                # Fully deterministic: argmax without any randomness
-                probs = torch.softmax(logits[:, 0, :], dim=-1)
-                action = torch.argmax(probs, dim=-1).item()
-            
-            return action
+            return agent.select_action(state, preference, deterministic=True)
         else:
             raise ValueError(f"Unknown agent type: {agent_type}")
     

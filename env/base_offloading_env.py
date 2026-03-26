@@ -1,3 +1,4 @@
+import copy
 import numpy as np
 import gym
 from gym import spaces
@@ -16,6 +17,7 @@ class TaskOffloadingEnv(gym.Env):
         # Add task dataset for meta-learning
         self.task_dataset = []
         self.current_task_id = 0
+        self.selected_task_template = None
 
         # Load configuration
         self.config = config
@@ -71,17 +73,18 @@ class TaskOffloadingEnv(gym.Env):
     def _setup_observation_space(self):
         """Setup observation space based on task type"""
         if self.task_type == 'dag':
-            # For DAG tasks: task features + graph structure + server states
+            # For DAG tasks: task summary + server summary + graph summary
             obs_dim = (
-                6 +  # task features (size, cycles, depth, etc.)
-                10 +  # server states (loads, frequencies)
-                20   # graph structure encoding
+                6 +   # task summary (size, cycles, preference, graph stats)
+                20 +  # structured server features
+                10    # graph summary encoding
             )
         else:
             # For independent tasks: task features + server states
             obs_dim = (
-                4 +  # task features
-                10   # server states
+                6 +
+                20 +
+                10
             )
         
         self.observation_space = spaces.Box(
@@ -120,10 +123,12 @@ class TaskOffloadingEnv(gym.Env):
         self.current_task_id = task_id
         
         if len(self.task_dataset) > 0 and task_id < len(self.task_dataset):
-            self.current_task = self.task_dataset[task_id]
+            self.selected_task_template = self.task_dataset[task_id]
         else:
             # Generate a new task if not in dataset
-            self.current_task = self._generate_task()
+            self.selected_task_template = self._generate_task()
+        
+        self.current_task = copy.deepcopy(self.selected_task_template)
     
     def load_task_dataset(self, task_graphs: List[Dict]):
         """
@@ -134,6 +139,130 @@ class TaskOffloadingEnv(gym.Env):
         """
         self.task_dataset = task_graphs
         print(f"Loaded {len(task_graphs)} tasks into environment dataset")
+
+    def clear_task_selection(self):
+        """Clear any sticky dataset task selection."""
+        self.selected_task_template = None
+
+    def _is_dag_task(self, task: Optional[Dict] = None) -> bool:
+        """Return True when the task contains graph structure."""
+        task = task if task is not None else self.current_task
+        return task is not None and 'tasks' in task and 'adj_matrix' in task
+
+    def _compute_topological_depths(self, adj_matrix: np.ndarray) -> np.ndarray:
+        """Compute DAG node depths using Kahn's algorithm."""
+        num_nodes = adj_matrix.shape[0]
+        in_degree = adj_matrix.sum(axis=0).astype(np.int64)
+        depths = np.zeros(num_nodes, dtype=np.float32)
+        queue = [idx for idx in range(num_nodes) if in_degree[idx] == 0]
+
+        while queue:
+            node = queue.pop(0)
+            successors = np.where(adj_matrix[node] > 0)[0]
+            for succ in successors:
+                depths[succ] = max(depths[succ], depths[node] + 1)
+                in_degree[succ] -= 1
+                if in_degree[succ] == 0:
+                    queue.append(int(succ))
+
+        return depths
+
+    def get_current_task_graph(self) -> Optional[Dict]:
+        """Return the active graph task when available."""
+        if self._is_dag_task():
+            return self.current_task
+        return None
+
+    def get_server_features(self) -> np.ndarray:
+        """Build the structured server feature vector used by TAMPO."""
+        channel_gains = self.channel_gains if self.channel_gains is not None else np.zeros(self.num_servers)
+        server_features = np.concatenate([
+            [self.cloud_freq / 10e9],
+            self.edge_freq / 10e9,
+            self.server_loads / 10.0,
+            channel_gains / 2.0
+        ]).astype(np.float32)
+
+        if len(server_features) < 20:
+            server_features = np.pad(server_features, (0, 20 - len(server_features)))
+
+        return server_features[:20].astype(np.float32)
+
+    def get_task_feature_matrix(self) -> np.ndarray:
+        """
+        Build a per-node feature matrix for the active task graph.
+
+        Feature layout:
+        [data_size, cycles, in_degree, out_degree, depth, comm_load]
+        """
+        if self.current_task is None:
+            return np.zeros((1, 6), dtype=np.float32)
+
+        if not self._is_dag_task():
+            size_norm = self.current_task['size'] / max(self.task_size_range[1], 1.0)
+            cycles_norm = self.current_task['cycles'] / max(self.task_cycles_range[1], 1.0)
+            return np.array([[size_norm, cycles_norm, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+
+        adj_matrix = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
+        num_nodes = adj_matrix.shape[0]
+        tasks = self.current_task['tasks']
+
+        in_degree = adj_matrix.sum(axis=0)
+        out_degree = adj_matrix.sum(axis=1)
+        depths = self._compute_topological_depths(adj_matrix)
+        max_depth = max(float(depths.max()), 1.0)
+        degree_scale = max(float(num_nodes - 1), 1.0)
+
+        comm_load = np.zeros(num_nodes, dtype=np.float32)
+        for edge in self.current_task.get('edges', []):
+            data = float(edge.get('data', 0.0))
+            comm_load[edge['source']] += data
+            comm_load[edge['target']] += data
+
+        max_comm = max(float(comm_load.max()), 1.0)
+        max_size = max(float(self.task_size_range[1]), 1.0)
+        max_cycles = max(float(self.task_cycles_range[1]), 1.0)
+
+        features = []
+        for idx, task in enumerate(tasks):
+            features.append([
+                float(task.get('data_size', 0.0)) / max_size,
+                float(task.get('cycles', 0.0)) / max_cycles,
+                float(in_degree[idx]) / degree_scale,
+                float(out_degree[idx]) / degree_scale,
+                float(depths[idx]) / max_depth,
+                float(comm_load[idx]) / max_comm
+            ])
+
+        return np.asarray(features, dtype=np.float32)
+
+    def _get_graph_summary_features(self) -> np.ndarray:
+        """Return compact graph-level summary features for the observation vector."""
+        if not self._is_dag_task():
+            return np.zeros(10, dtype=np.float32)
+
+        node_features = self.get_task_feature_matrix()
+        adj_matrix = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
+        num_nodes = adj_matrix.shape[0]
+        edge_count = float(adj_matrix.sum())
+        possible_edges = max(float(num_nodes * max(num_nodes - 1, 1)), 1.0)
+        edge_density = edge_count / possible_edges
+        source_ratio = float((adj_matrix.sum(axis=0) == 0).mean())
+        sink_ratio = float((adj_matrix.sum(axis=1) == 0).mean())
+
+        summary = np.array([
+            min(num_nodes / 50.0, 1.0),
+            edge_density,
+            float(node_features[:, 0].mean()),
+            float(node_features[:, 0].std()),
+            float(node_features[:, 1].mean()),
+            float(node_features[:, 1].std()),
+            float(node_features[:, 2].mean()),
+            float(node_features[:, 3].mean()),
+            source_ratio,
+            sink_ratio
+        ], dtype=np.float32)
+        return summary
     
     def reset(self, task_graph=None, preference_vector=None) -> np.ndarray:
         """
@@ -162,11 +291,23 @@ class TaskOffloadingEnv(gym.Env):
         
         # Load task or generate new one
         if task_graph is not None:
-            self.current_task = task_graph
+            self.selected_task_template = task_graph
+        
+        if self.selected_task_template is not None:
+            self.current_task = copy.deepcopy(self.selected_task_template)
         else:
             self.current_task = self._generate_task()
         
         return self._get_observation()
+
+    def get_adjacency_matrix(self) -> Optional[np.ndarray]:
+        """
+        Get the adjacency matrix for the current task if it is a DAG.
+        Returns None if no graph or independent task.
+        """
+        if self.current_task is not None and 'adj_matrix' in self.current_task:
+            return self.current_task['adj_matrix']
+        return None
     
     def _execute_offloading(self, action: int) -> Tuple[float, float]:
         """
@@ -266,25 +407,29 @@ class TaskOffloadingEnv(gym.Env):
         task_cycles_norm = (self.current_task['cycles'] - self.task_cycles_range[0]) / \
                            (self.task_cycles_range[1] - self.task_cycles_range[0])
         
-        # Server features
-        server_freqs_norm = np.concatenate([
-            [self.cloud_freq / 10e9],
-            self.edge_freq / 10e9
-        ])
-        
-        server_loads_norm = self.server_loads / 10.0  # Normalize by max expected load
-        
-        # Channel gains
-        channel_gains_norm = self.channel_gains / 2.0
-        
+        if self._is_dag_task():
+            num_nodes = float(self.current_task.get('num_tasks', len(self.current_task.get('tasks', []))))
+            adj_matrix = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
+            possible_edges = max(num_nodes * max(num_nodes - 1.0, 1.0), 1.0)
+            edge_density = float(adj_matrix.sum()) / possible_edges
+        else:
+            num_nodes = 1.0
+            edge_density = 0.0
+
+        task_summary = np.array([
+            task_size_norm,
+            task_cycles_norm,
+            float(self.preference[0]),
+            float(self.preference[1]),
+            min(num_nodes / 50.0, 1.0),
+            edge_density
+        ], dtype=np.float32)
+
+        server_features = self.get_server_features()
+        graph_summary = self._get_graph_summary_features()
+
         # Combine features
-        obs = np.concatenate([
-            [task_size_norm, task_cycles_norm],
-            self.preference,
-            server_freqs_norm,
-            server_loads_norm,
-            channel_gains_norm
-        ])
+        obs = np.concatenate([task_summary, server_features, graph_summary])
         
         # Pad to observation space size
         if len(obs) < self.observation_space.shape[0]:
@@ -347,7 +492,7 @@ class TaskOffloadingEnv(gym.Env):
         
         # Update state
         self.current_step += 1
-        done = self.current_step >= self.max_steps
+        done = self._is_dag_task() or self.current_step >= self.max_steps
         
         if not done:
             self.current_task = self._generate_task()

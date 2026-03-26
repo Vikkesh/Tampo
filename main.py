@@ -26,7 +26,14 @@ def load_config(config_path):
 
 def setup_environment(config):
     """Setup the task offloading environment"""
-    env = TaskOffloadingEnv(config['system'])
+    env_config = {
+        **config.get('system', {}),
+        **config.get('computing', {}),
+        **config.get('energy', {}),
+        **config.get('network', {}),
+        **config.get('tasks', {})
+    }
+    env = TaskOffloadingEnv(env_config)
     return env
 
 def get_user_input():
@@ -66,11 +73,14 @@ def get_user_input():
     gmorl_run = input("Run GMORL? (yes/no): ").strip().lower()
     algorithms['GMORL'] = gmorl_run in ['yes', 'y']
     
-    tampo_run = input("Run TAMPO? (yes/no): ").strip().lower()
-    algorithms['TAMPO'] = tampo_run in ['yes', 'y']
+    tampo_lstm_run = input("Run TAMPO-LSTM? (yes/no): ").strip().lower()
+    algorithms['TAMPO_LSTM'] = tampo_lstm_run in ['yes', 'y']
+    
+    tampo_gcn_run = input("Run TAMPO-GCN? (yes/no): ").strip().lower()
+    algorithms['TAMPO_GCN'] = tampo_gcn_run in ['yes', 'y']
     
     # Common training/evaluation parameters for RL
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
         print("\n\nRL TRAINING & EVALUATION PARAMETERS:")
         print("-" * 40)
         
@@ -87,7 +97,7 @@ def get_user_input():
         else:
             algorithms['gmorl_episodes'] = 100
         
-        if algorithms['TAMPO']:
+        if algorithms['TAMPO_LSTM'] or algorithms['TAMPO_GCN']:
             tampo_iterations = input("Number of meta-iterations for TAMPO (default 100): ").strip()
             algorithms['tampo_iterations'] = int(tampo_iterations) if tampo_iterations else 100
         else:
@@ -118,8 +128,10 @@ def get_user_input():
         selected.append(f"PPO ({algorithms['ppo_episodes']} training episodes)")
     if algorithms['GMORL']:
         selected.append(f"GMORL ({algorithms['gmorl_episodes']} training episodes)")
-    if algorithms['TAMPO']:
-        selected.append(f"TAMPO ({algorithms['tampo_iterations']} meta-iterations)")
+    if algorithms['TAMPO_LSTM']:
+        selected.append(f"TAMPO_LSTM ({algorithms['tampo_iterations']} meta-iterations)")
+    if algorithms['TAMPO_GCN']:
+        selected.append(f"TAMPO_GCN ({algorithms['tampo_iterations']} meta-iterations)")
     
     if len(selected) == 0:
         print("\n⚠️  No algorithms selected. Exiting...")
@@ -132,7 +144,7 @@ def get_user_input():
     if any([algorithms['HEFT'], algorithms['PSO'], algorithms['GA']]):
         print(f"\nHeuristic test tasks: {algorithms['heuristic_tasks']}")
     
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
         print(f"RL evaluation episodes: {algorithms['eval_episodes']} (common for all RL algorithms)")
     
     print("\n" + "="*70)
@@ -219,15 +231,19 @@ def test_gmorl(env, config, evaluator, train_episodes=100):
         print("✓ GMORL completed")
     return result
 
-def test_tampo(env, dag_parser, config, evaluator, train_iterations=100):
+def test_tampo(env, dag_parser, config, evaluator, train_iterations=100, encoder_type='lstm'):
     """Test TAM-PO algorithm using common evaluator"""
     
-    # Define checkpoint path
-    checkpoint_path = "models/tampo_checkpoint.pth"
+    # Combine training config with TAMPO specific config
+    tampo_config = {**config['training'], **config['algorithms'].get('tampo', {})}
+    tampo_config['encoder_type'] = encoder_type
+    
+    # Define checkpoint path dynamically based on encoder type
+    checkpoint_path = f"models/tampo_{encoder_type}_checkpoint.pth"
     
     # Always use checkpoint if it exists - no user prompt
     if os.path.exists(checkpoint_path):
-        print(f"\n📂 Found existing TAM-PO checkpoint - resuming training")
+        print(f"\n📂 Found existing TAM-PO ({encoder_type.upper()}) checkpoint - resuming training")
     else:
         print(f"\n🆕 No existing checkpoint found - starting fresh training")
     
@@ -246,6 +262,7 @@ def test_tampo(env, dag_parser, config, evaluator, train_iterations=100):
             'num_tasks': dag['num_tasks'],
             'tasks': dag['tasks'],
             'edges': dag['edges'],
+            'adj_matrix': dag['adj_matrix'],
             'size': sum(t['data_size'] for t in dag['tasks']),
             'cycles': sum(t['cycles'] for t in dag['tasks'])
         }
@@ -257,7 +274,7 @@ def test_tampo(env, dag_parser, config, evaluator, train_iterations=100):
     
     # Create TAM-PO framework - checkpoint loaded automatically in __init__
     print(f"\n[6/6] Training TAM-PO ({train_iterations} meta-iterations)...")
-    tampo_framework = TAMPOFramework(env, config['training'], model_path=checkpoint_path)
+    tampo_framework = TAMPOFramework(env, tampo_config, model_path=checkpoint_path)
     
     # Train
     tampo_framework.train(
@@ -271,6 +288,9 @@ def test_tampo(env, dag_parser, config, evaluator, train_iterations=100):
     result = evaluator.evaluate_rl_agent(tampo_framework, agent_type='tampo')
     if result:
         print("✓ TAM-PO completed")
+    
+    if hasattr(env, 'clear_task_selection'):
+        env.clear_task_selection()
     
     return result
 
@@ -303,8 +323,9 @@ def plot_comparison(results, output_dir):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
     
     # Delay comparison
-    colors = ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6', '#1abc9c']
-    ax1.bar(algorithms, delays, color=colors[:len(algorithms)], alpha=0.8, edgecolor='black')
+    color_map = plt.get_cmap('tab10')
+    colors = [color_map(i % color_map.N) for i in range(len(algorithms))]
+    ax1.bar(algorithms, delays, color=colors, alpha=0.8, edgecolor='black')
     ax1.set_ylabel('Average Delay (s)', fontsize=12, fontweight='bold')
     ax1.set_title('Delay Comparison', fontsize=14, fontweight='bold')
     ax1.tick_params(axis='x', rotation=45)
@@ -314,7 +335,7 @@ def plot_comparison(results, output_dir):
         ax1.text(i, delay, f'{delay:.2f}', ha='center', va='bottom', fontsize=9)
     
     # Energy comparison
-    ax2.bar(algorithms, energies, color=colors[:len(algorithms)], alpha=0.8, edgecolor='black')
+    ax2.bar(algorithms, energies, color=colors, alpha=0.8, edgecolor='black')
     ax2.set_ylabel('Average Energy (J)', fontsize=12, fontweight='bold')
     ax2.set_title('Energy Comparison', fontsize=14, fontweight='bold')
     ax2.tick_params(axis='x', rotation=45)
@@ -435,10 +456,23 @@ def main():
         if result:
             results['GMORL'] = result
     
-    if user_choices['TAMPO']:
-        result = test_tampo(env, dag_parser, config, evaluator, user_choices['tampo_iterations'])
+    if user_choices['TAMPO_LSTM']:
+        result = test_tampo(
+            env, dag_parser, config, evaluator,
+            user_choices['tampo_iterations'],
+            encoder_type='lstm'
+        )
         if result:
-            results['TAMPO'] = result
+            results['TAMPO_LSTM'] = result
+    
+    if user_choices['TAMPO_GCN']:
+        result = test_tampo(
+            env, dag_parser, config, evaluator,
+            user_choices['tampo_iterations'],
+            encoder_type='gcn'
+        )
+        if result:
+            results['TAMPO_GCN'] = result
     
     # Display detailed comparison using common evaluator
     if len(results) > 0:

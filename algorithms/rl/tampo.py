@@ -4,17 +4,55 @@ import torch.optim as optim
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
+from torch.func import functional_call
 from collections import deque
 import copy
 import os
 
+def _pad_graph_batch(
+    task_features_list: List[np.ndarray],
+    adjacency_list: Optional[List[np.ndarray]] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pad variable-size graphs into a dense batch plus node mask."""
+    batch_size = len(task_features_list)
+    max_nodes = max(features.shape[0] for features in task_features_list)
+    feature_dim = task_features_list[0].shape[1]
+
+    task_batch = np.zeros((batch_size, max_nodes, feature_dim), dtype=np.float32)
+    adj_batch = np.zeros((batch_size, max_nodes, max_nodes), dtype=np.float32)
+    node_mask = np.zeros((batch_size, max_nodes), dtype=np.float32)
+
+    for idx, features in enumerate(task_features_list):
+        num_nodes = features.shape[0]
+        task_batch[idx, :num_nodes] = features
+        node_mask[idx, :num_nodes] = 1.0
+
+        if adjacency_list is not None and adjacency_list[idx] is not None:
+            adj = np.asarray(adjacency_list[idx], dtype=np.float32)
+        else:
+            adj = np.eye(num_nodes, dtype=np.float32)
+        adj_batch[idx, :num_nodes, :num_nodes] = adj
+
+    return task_batch, adj_batch, node_mask
+
 class DAGEncoder(nn.Module):
     """
-    Enhanced encoder for DAG structure using GNN-inspired approach
+    Enhanced encoder for DAG structure using LSTM or GCN approach.
     """
     
-    def __init__(self, task_feature_dim: int, hidden_dim: int, num_layers: int = 2):
+    def __init__(
+        self,
+        task_feature_dim: int,
+        hidden_dim: int,
+        num_layers: int = 2,
+        encoder_type: str = 'lstm'
+    ):
         super(DAGEncoder, self).__init__()
+        
+        self.encoder_type = encoder_type.lower()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = nn.Dropout(0.1)
         
         self.task_embedding = nn.Sequential(
             nn.Linear(task_feature_dim, hidden_dim),
@@ -22,17 +60,30 @@ class DAGEncoder(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
-        # BiLSTM for sequential processing
-        self.lstm = nn.LSTM(
-            hidden_dim, 
-            hidden_dim, 
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.1 if num_layers > 1 else 0
-        )
+        if self.encoder_type in {'lstm', 'both'}:
+            self.lstm = nn.LSTM(
+                hidden_dim, 
+                hidden_dim, 
+                num_layers=num_layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=0.1 if num_layers > 1 else 0
+            )
+        if self.encoder_type in {'gcn', 'both'}:
+            self.gcn_layers = nn.ModuleList([
+                nn.Linear(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2) 
+                for i in range(num_layers)
+            ])
+        if self.encoder_type not in {'lstm', 'gcn', 'both'}:
+            raise ValueError(f"Unsupported encoder type: {self.encoder_type}")
         
-        # Graph attention for dependency modeling
+        if self.encoder_type == 'both':
+            self.hybrid_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 4, hidden_dim * 2),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim * 2)
+            )
+        
         self.graph_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim * 2,
             num_heads=4,
@@ -41,35 +92,101 @@ class DAGEncoder(nn.Module):
         
         self.layer_norm = nn.LayerNorm(hidden_dim * 2)
         
-    def forward(self, task_features, adjacency_matrix=None):
+    def _masked_max_pool(self, x, node_mask):
+        """Max pool only across valid nodes."""
+        if node_mask is None:
+            return x.max(dim=1)[0]
+        masked_x = x.masked_fill(~node_mask.unsqueeze(-1), float('-inf'))
+        pooled = masked_x.max(dim=1)[0]
+        pooled[torch.isinf(pooled)] = 0.0
+        return pooled
+
+    def _apply_lstm(self, x, node_mask=None):
+        """BiLSTM sequence encoder over topologically ordered node features."""
+        if node_mask is None:
+            out, _ = self.lstm(x)
+            return out
+
+        lengths = node_mask.sum(dim=1).clamp(min=1).to(dtype=torch.int64).cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths, batch_first=True, enforce_sorted=False
+        )
+        packed_out, _ = self.lstm(packed)
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True, total_length=x.size(1)
+        )
+        return out
+
+    def _apply_gcn(self, x, adj, node_mask=None):
+        """Dense GCN over a padded adjacency batch."""
+        batch_size, num_tasks, _ = x.shape
+        if adj is None:
+            adj = torch.eye(num_tasks).unsqueeze(0).repeat(batch_size, 1, 1).to(x.device)
+
+        adj = adj.float()
+        adj = torch.maximum(adj, adj.transpose(1, 2))
+
+        if node_mask is not None:
+            valid_pairs = node_mask.unsqueeze(1).float() * node_mask.unsqueeze(2).float()
+            adj = adj * valid_pairs
+
+        eye = torch.eye(num_tasks, device=x.device).unsqueeze(0).expand(batch_size, -1, -1)
+        if node_mask is not None:
+            eye = eye * node_mask.unsqueeze(-1).float()
+        adj_self = adj + eye
+
+        degree = adj_self.sum(dim=-1).clamp(min=1e-6)
+        d_inv_sqrt = torch.diag_embed(torch.pow(degree, -0.5))
+        norm_adj = torch.bmm(torch.bmm(d_inv_sqrt, adj_self), d_inv_sqrt)
+        
+        for i, layer in enumerate(self.gcn_layers):
+            support = layer(x)
+            x = torch.bmm(norm_adj, support)
+            if i < len(self.gcn_layers) - 1:
+                x = self.dropout(torch.relu(x))
+            if node_mask is not None:
+                x = x * node_mask.unsqueeze(-1).float()
+                
+        return x
+
+    def forward(self, task_features, adjacency_matrix=None, node_mask=None):
         """
         Args:
             task_features: [batch, num_tasks, feature_dim]
             adjacency_matrix: [batch, num_tasks, num_tasks] optional
+            node_mask: [batch, num_tasks] optional
         
         Returns:
             encoded_tasks: [batch, num_tasks, hidden_dim * 2]
             context: [batch, hidden_dim * 2]
         """
-        batch_size, num_tasks, _ = task_features.shape
-        
-        # Embed tasks
         embedded = self.task_embedding(task_features)
-        
-        # LSTM encoding
-        lstm_out, (h_n, c_n) = self.lstm(embedded)
-        
-        # Graph attention if adjacency provided
-        if adjacency_matrix is not None:
-            attn_out, _ = self.graph_attention(
-                lstm_out, lstm_out, lstm_out
-            )
-            encoded = self.layer_norm(lstm_out + attn_out)
+        if node_mask is not None:
+            embedded = embedded * node_mask.unsqueeze(-1).float()
+
+        encoded_streams = []
+        if self.encoder_type in {'lstm', 'both'}:
+            encoded_streams.append(self._apply_lstm(embedded, node_mask))
+        if self.encoder_type in {'gcn', 'both'}:
+            encoded_streams.append(self._apply_gcn(embedded, adjacency_matrix, node_mask))
+
+        if self.encoder_type == 'both':
+            out = self.hybrid_fusion(torch.cat(encoded_streams, dim=-1))
         else:
-            encoded = self.layer_norm(lstm_out)
-        
-        # Context from final hidden states
-        context = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+            out = encoded_streams[0]
+
+        key_padding_mask = None
+        if node_mask is not None:
+            key_padding_mask = ~node_mask.bool()
+
+        attn_out, _ = self.graph_attention(
+            out, out, out, key_padding_mask=key_padding_mask
+        )
+        encoded = self.layer_norm(out + self.dropout(attn_out))
+        if node_mask is not None:
+            encoded = encoded * node_mask.unsqueeze(-1).float()
+
+        context = self._masked_max_pool(encoded, node_mask.bool() if node_mask is not None else None)
         
         return encoded, context
 
@@ -109,11 +226,14 @@ class PreferenceConditionedDecoder(nn.Module):
             nn.Linear(hidden_dim, num_resources)
         )
         
-    def forward(self, encoded_tasks, context, preference, num_steps):
+    def forward(self, encoded_tasks, context, preference, num_steps, node_mask=None):
         """
         Sequential decoding with preference conditioning
         """
         batch_size = encoded_tasks.size(0)
+        key_padding_mask = None
+        if node_mask is not None:
+            key_padding_mask = ~node_mask.bool()
         
         # Encode preference
         pref_encoded = self.preference_encoder(preference)
@@ -129,7 +249,7 @@ class PreferenceConditionedDecoder(nn.Module):
             query = torch.cat([h_t, pref_encoded], dim=-1).unsqueeze(1)
             
             attn_out, attn_weights = self.attention(
-                query, encoded_tasks, encoded_tasks
+                query, encoded_tasks, encoded_tasks, key_padding_mask=key_padding_mask
             )
             
             attn_context = attn_out.squeeze(1)
@@ -168,14 +288,15 @@ class MetaPolicyNetwork(nn.Module):
         server_feature_dim: int,
         num_resources: int,
         hidden_dim: int = 256,
-        num_encoder_layers: int = 2
+        num_encoder_layers: int = 2,
+        encoder_type: str = 'lstm'
     ):
         super(MetaPolicyNetwork, self).__init__()
         
         self.hidden_dim = hidden_dim
         
         self.encoder = DAGEncoder(
-            task_feature_dim, hidden_dim, num_encoder_layers
+            task_feature_dim, hidden_dim, num_encoder_layers, encoder_type=encoder_type
         )
         
         self.decoder = PreferenceConditionedDecoder(
@@ -192,22 +313,24 @@ class MetaPolicyNetwork(nn.Module):
             nn.LayerNorm(hidden_dim * 2)
         )
         
-    def forward(self, task_features, server_features, preference, num_tasks, adjacency=None):
+    def forward(
+        self,
+        task_features,
+        server_features,
+        preference,
+        num_decisions: int = 1,
+        adjacency=None,
+        node_mask=None
+    ):
         """
         Forward pass
         """
-        # Encode DAG
-        encoded_tasks, context = self.encoder(task_features, adjacency)
+        encoded_tasks, context = self.encoder(task_features, adjacency, node_mask)
         
-        # Encode server state
         server_encoded = self.server_encoder(server_features)
-        
-        # Combine contexts
         combined_context = context + server_encoded
-        
-        # Decode decisions
         action_logits = self.decoder(
-            encoded_tasks, combined_context, preference, num_tasks
+            encoded_tasks, combined_context, preference, num_decisions, node_mask=node_mask
         )
         
         return action_logits
@@ -365,31 +488,52 @@ class LowerLayerAgent:
         self.update_needed = False
         self.update_package = None
     
-    def _forward_with_params(self, params_dict, task_features, server_features, preference, num_tasks):
+    def _prepare_policy_batch(
+        self,
+        batch: List[Dict]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pad graph batches and convert them to tensors."""
+        task_features_np, adjacency_np, node_mask_np = _pad_graph_batch(
+            [np.asarray(exp['task_features'], dtype=np.float32) for exp in batch],
+            [np.asarray(exp.get('adj_matrix'), dtype=np.float32) if exp.get('adj_matrix') is not None else None for exp in batch]
+        )
+        task_features = torch.FloatTensor(task_features_np).to(self.device)
+        adjacency = torch.FloatTensor(adjacency_np).to(self.device)
+        node_mask = torch.BoolTensor(node_mask_np.astype(bool)).to(self.device)
+
+        server_features = torch.FloatTensor(
+            np.array([exp['server_features'] for exp in batch], dtype=np.float32)
+        ).to(self.device)
+
+        return task_features, server_features, adjacency, node_mask
+
+    def _forward_with_params(
+        self,
+        params_dict,
+        task_features,
+        server_features,
+        preference,
+        num_decisions: int = 1,
+        adjacency=None,
+        node_mask=None
+    ):
         """
         Forward pass using specific parameters (for functional gradient computation)
-        This is the KEY to making MAML work - we use functional programming style
+        This keeps the full inner-loop update chain differentiable for MAML.
         """
-        # This is a simplified version - you'd need to implement proper functional forward
-        # For now, we'll use a workaround with temporary parameter assignment
-        
-        # Save original parameters
-        original_params = {}
-        for name, param in self.meta_policy.named_parameters():
-            original_params[name] = param.data.clone()
-        
-        # Temporarily set adapted parameters
-        for name, param in self.meta_policy.named_parameters():
-            if name in params_dict:
-                param.data = params_dict[name]
-        
-        # Forward pass
-        output = self.meta_policy(task_features, server_features, preference, num_tasks)
-        
-        # Restore original parameters
-        for name, param in self.meta_policy.named_parameters():
-            param.data = original_params[name]
-        
+        buffer_dict = dict(self.meta_policy.named_buffers())
+
+        output = functional_call(
+            self.meta_policy,
+            (params_dict, buffer_dict),
+            (task_features, server_features, preference),
+            {
+                'num_decisions': num_decisions,
+                'adjacency': adjacency,
+                'node_mask': node_mask
+            }
+        )
+
         return output
         
     def inner_loop_update(self, experiences: List[Dict], num_steps: int, create_graph: bool = False):
@@ -460,24 +604,21 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
-        task_features_list = [exp['task_features'] for exp in batch]
-        task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
-        if len(task_features.shape) == 4:
-            task_features = task_features.squeeze(1)
-        
-        server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
-        if len(server_features.shape) == 3:
-            server_features = server_features.squeeze(1)
+        task_features, server_features, adjacency, node_mask = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+            
         # Forward pass with adapted parameters
-        num_tasks = task_features.size(1)
         action_logits = self._forward_with_params(
-            params_dict, task_features, server_features, preferences, num_tasks
+            params_dict,
+            task_features,
+            server_features,
+            preferences,
+            num_decisions=1,
+            adjacency=adjacency,
+            node_mask=node_mask
         )
         
         # Policy loss
@@ -509,23 +650,21 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
-        task_features_list = [exp['task_features'] for exp in batch]
-        task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
-        if len(task_features.shape) == 4:
-            task_features = task_features.squeeze(1)
-        
-        server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
-        if len(server_features.shape) == 3:
-            server_features = server_features.squeeze(1)
+        task_features, server_features, adjacency, node_mask = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+            
         # Forward pass
-        num_tasks = task_features.size(1)
-        action_logits = self.meta_policy(task_features, server_features, preferences, num_tasks)
+        action_logits = self.meta_policy(
+            task_features,
+            server_features,
+            preferences,
+            num_decisions=1,
+            adjacency=adjacency,
+            node_mask=node_mask
+        )
         
         # Policy loss
         logits = action_logits[:, 0, :]
@@ -796,14 +935,17 @@ class TAMPOFramework:
         task_feature_dim = 6
         server_feature_dim = 20
         num_resources = env.action_space.n
-        hidden_dim = config.get('hidden_dim', 128)  # Smaller network
+        hidden_dim = config.get('hidden_dim', config.get('hidden_dims', [128])[0])
+        encoder_type = config.get('encoder_type', 'lstm')
+        self.encoder_type = encoder_type
         
         # Initialize networks
         meta_policy = MetaPolicyNetwork(
             task_feature_dim=task_feature_dim,
             server_feature_dim=server_feature_dim,
             num_resources=num_resources,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            encoder_type=encoder_type
         )
         
         value_network = MultiObjectiveValueNetwork(
@@ -962,15 +1104,13 @@ class TAMPOFramework:
     
     def _collect_task_experiences(self, task_id: int, num_episodes: int = 10):
         """Collect MORE experiences for better learning"""
-        train_experiences = []
-        test_experiences = []
+        all_experiences = []
         
         for ep in range(num_episodes):  # Increased from 5 to 10
             preference = self._sample_preference()
             
             state = self.env.reset(preference_vector=preference)
             done = False
-            episode_exp = []
             
             step_count = 0
             max_steps = 50  # More steps per episode
@@ -978,8 +1118,15 @@ class TAMPOFramework:
             while not done and step_count < max_steps:
                 task_features = self._extract_task_features(state)
                 server_features = self._extract_server_features(state)
+                adj_matrix = self._extract_adjacency_matrix()
                 
-                action = self._select_action(task_features, server_features, preference)
+                action = self._select_action(
+                    task_features,
+                    server_features,
+                    preference,
+                    adj_matrix,
+                    deterministic=False
+                )
                 
                 next_state, reward, done, info = self.env.step(action)
                 
@@ -987,6 +1134,7 @@ class TAMPOFramework:
                     'state': state,
                     'task_features': task_features,
                     'server_features': server_features,
+                    'adj_matrix': adj_matrix,
                     'action': action,
                     'reward': reward,  # Use raw reward (already very strong signal)
                     'preference': preference,
@@ -994,17 +1142,20 @@ class TAMPOFramework:
                     'next_state': next_state,
                     'done': done
                 }
-                episode_exp.append(exp)
+                all_experiences.append(exp)
                 
                 state = next_state
                 step_count += 1
-            
-            # Split train/test 80/20
-            if len(episode_exp) > 0:
-                split = max(1, int(len(episode_exp) * 0.8))
-                train_experiences.extend(episode_exp[:split])
-                test_experiences.extend(episode_exp[split:])
-        
+
+        if len(all_experiences) <= 1:
+            return all_experiences, all_experiences
+
+        split = max(1, int(len(all_experiences) * 0.8))
+        if split >= len(all_experiences):
+            split = len(all_experiences) - 1
+
+        train_experiences = all_experiences[:split]
+        test_experiences = all_experiences[split:]
         return train_experiences, test_experiences
     
     def _sample_preference(self) -> np.ndarray:
@@ -1013,36 +1164,96 @@ class TAMPOFramework:
         w_energy = 1.0 - w_delay
         return np.array([w_delay, w_energy])
     
-    def _extract_task_features(self, state: np.ndarray) -> np.ndarray:
-        """Extract task features"""
-        task_feat = state[:6].reshape(1, 1, -1)
-        return task_feat
+    def _extract_task_features(self, state: Optional[np.ndarray] = None) -> np.ndarray:
+        """Extract graph node features for the active DAG."""
+        if hasattr(self.env, 'get_task_feature_matrix'):
+            features = self.env.get_task_feature_matrix()
+            if features is not None:
+                return np.asarray(features, dtype=np.float32)
+
+        if state is None:
+            return np.zeros((1, 6), dtype=np.float32)
+
+        return np.asarray(state[:6], dtype=np.float32).reshape(1, -1)
     
-    def _extract_server_features(self, state: np.ndarray) -> np.ndarray:
-        """Extract server features"""
-        server_feat = state[6:26].reshape(1, -1)
-        return server_feat
+    def _extract_server_features(self, state: Optional[np.ndarray] = None) -> np.ndarray:
+        """Extract structured server features."""
+        if hasattr(self.env, 'get_server_features'):
+            features = self.env.get_server_features()
+            if features is not None:
+                return np.asarray(features, dtype=np.float32)
+
+        if state is None:
+            return np.zeros(20, dtype=np.float32)
+
+        server_slice = state[6:26]
+        if len(server_slice) < 20:
+            server_slice = np.pad(server_slice, (0, 20 - len(server_slice)))
+        return np.asarray(server_slice[:20], dtype=np.float32)
+
+    def _extract_adjacency_matrix(self) -> np.ndarray:
+        """Return the active adjacency matrix or a single-node identity fallback."""
+        if hasattr(self.env, 'get_adjacency_matrix'):
+            adj_matrix = self.env.get_adjacency_matrix()
+            if adj_matrix is not None:
+                return np.asarray(adj_matrix, dtype=np.float32)
+
+        node_count = self._extract_task_features().shape[0]
+        return np.eye(node_count, dtype=np.float32)
+
+    def select_action(self, state: np.ndarray, preference: np.ndarray, deterministic: bool = True) -> int:
+        """Public deterministic action helper used by evaluation."""
+        task_features = self._extract_task_features(state)
+        server_features = self._extract_server_features(state)
+        adj_matrix = self._extract_adjacency_matrix()
+        return self._select_action(
+            task_features,
+            server_features,
+            preference,
+            adj_matrix=adj_matrix,
+            deterministic=deterministic
+        )
     
-    def _select_action(self, task_features, server_features, preference):
-        """Select action - minimal exploration needed with strong init"""
+    def _select_action(
+        self,
+        task_features,
+        server_features,
+        preference,
+        adj_matrix=None,
+        deterministic: bool = False
+    ):
+        """Select a graph-conditioned offloading action."""
         with torch.no_grad():
-            task_tensor = torch.FloatTensor(task_features).to(self.device)
-            server_tensor = torch.FloatTensor(server_features).to(self.device)
+            task_tensor = torch.FloatTensor(task_features).unsqueeze(0).to(self.device)
+            server_tensor = torch.FloatTensor(server_features).unsqueeze(0).to(self.device)
             pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
+            node_mask = torch.ones((1, task_features.shape[0]), dtype=torch.bool, device=self.device)
+            
+            if adj_matrix is None:
+                adj_matrix = np.eye(task_features.shape[0], dtype=np.float32)
+            adj_tensor = torch.FloatTensor(adj_matrix).unsqueeze(0).to(self.device)
             
             logits = self.agents[0].meta_policy(
-                task_tensor, server_tensor, pref_tensor, num_tasks=1
+                task_tensor,
+                server_tensor,
+                pref_tensor,
+                num_decisions=1,
+                adjacency=adj_tensor,
+                node_mask=node_mask
             )
             
             probs = torch.softmax(logits[:, 0, :], dim=-1)
             
-            # Very minimal exploration (5%)
-            if np.random.rand() < 0.05:
-                # Even in exploration, never choose local
-                weights = np.array([0.0, 0.5, 0.25, 0.25])  # No local!
-                action = np.random.choice(len(weights), p=weights/weights.sum())
-            else:
+            if deterministic or np.random.rand() >= 0.05:
                 action = torch.argmax(probs, dim=-1).item()
+            else:
+                exploration_weights = np.zeros(self.env.action_space.n, dtype=np.float32)
+                if self.env.action_space.n > 1:
+                    exploration_weights[1:] = 1.0
+                action = int(np.random.choice(
+                    self.env.action_space.n,
+                    p=exploration_weights / exploration_weights.sum()
+                ))
         
         return action
     
@@ -1074,10 +1285,7 @@ class TAMPOFramework:
                 max_steps = 50
                 
                 while not done and step_count < max_steps:
-                    task_features = self._extract_task_features(state)
-                    server_features = self._extract_server_features(state)
-                    
-                    action = self._select_action(task_features, server_features, pref)
+                    action = self.select_action(state, pref, deterministic=True)
                     
                     state, reward, done, info = self.env.step(action)
                     

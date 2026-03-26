@@ -69,6 +69,9 @@ class DAGParser:
                     'cycles': cycles
                 })
             
+            tasks.sort(key=lambda task: task['id'])
+            id_to_index = {task['id']: idx for idx, task in enumerate(tasks)}
+            
             # Parse edges (dependencies)
             for edge in dot_graph.get_edge_list():
                 src = int(edge.get_source().strip('"'))
@@ -78,15 +81,20 @@ class DAGParser:
                 comm_size = self.safe_float_convert(attrs.get('size', 0))
                 
                 edges.append({
-                    'source': src - 1,  # Convert to 0-indexed
-                    'target': dst - 1,
+                    'source': id_to_index[src],
+                    'target': id_to_index[dst],
                     'data': comm_size
                 })
             
+            adj_matrix = np.zeros((len(tasks), len(tasks)))
+            for edge in edges:
+                adj_matrix[edge['source'], edge['target']] = 1
+
             return {
                 'num_tasks': len(tasks),
                 'tasks': tasks,
-                'edges': edges
+                'edges': edges,
+                'adj_matrix': adj_matrix
             }
             
         except Exception as e:
