@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where python *)",
+      "PowerShell(Get-ChildItem *)",
+      "Bash(C:\\\\Users\\\\anura\\\\anaconda3\\\\python.exe *)",
+      "PowerShell(& \"$env:USERPROFILE\\\\anaconda3\\\\python.exe\" -c \"import torch_geometric; print\\(torch_geometric.__version__\\)\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\anaconda3\\\\python.exe\" -c \"import torch; print\\(torch.__version__\\)\")",
+      "PowerShell(& \"$env:USERPROFILE\\\\anaconda3\\\\Scripts\\\\conda.exe\" run -n base python -c \"import torch; print\\('torch', torch.__version__\\); import torch_geometric; print\\('pyg', torch_geometric.__version__\\)\" 2>&1)",
+      "Bash(/c/Users/anura/PycharmProjects/Lockout-Botulala/.venv/Scripts/python.exe -c \"import torch_geometric; print\\(torch_geometric.__version__\\)\")",
+      "Bash(/c/Users/anura/anaconda3/python.exe *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(\"/c/Users/anura/AppData/Local/Programs/Python/Python312/python.exe\" -c \"import torch; print\\(torch.__version__\\)\")",
+      "Read(//c/Program Files/Python310//**)",
+      "Read(//c/Program Files/Python310/**)",
+      "Bash(python smoke_test_gat.py)"
+    ]
+  }
+}

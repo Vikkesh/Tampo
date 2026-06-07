@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
 from torch.func import functional_call
 from torch_geometric.data import Batch, Data
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GATv2Conv
 from torch_geometric.utils import to_dense_batch, to_undirected
 from collections import deque
 import copy
@@ -71,7 +71,8 @@ class DAGEncoder(nn.Module):
         task_feature_dim: int,
         hidden_dim: int,
         num_layers: int = 2,
-        encoder_type: str = 'lstm'
+        encoder_type: str = 'lstm',
+        num_gat_heads: int = 8
     ):
         super(DAGEncoder, self).__init__()
         
@@ -100,7 +101,23 @@ class DAGEncoder(nn.Module):
                 GCNConv(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2)
                 for i in range(num_layers)
             ])
-        if self.encoder_type not in {'lstm', 'gcn', 'both'}:
+        if self.encoder_type == 'gat':
+            assert (hidden_dim * 2) % num_gat_heads == 0, (
+                f"hidden_dim*2 ({hidden_dim * 2}) must be divisible by num_gat_heads ({num_gat_heads})"
+            )
+            _gat_out = (hidden_dim * 2) // num_gat_heads
+            self.gat_layers = nn.ModuleList([
+                GATv2Conv(
+                    in_channels=hidden_dim if i == 0 else hidden_dim * 2,
+                    out_channels=_gat_out,
+                    heads=num_gat_heads,
+                    concat=True,
+                    dropout=0.1,
+                    add_self_loops=True
+                )
+                for i in range(num_layers)
+            ])
+        if self.encoder_type not in {'lstm', 'gcn', 'gat', 'both'}:
             raise ValueError(f"Unsupported encoder type: {self.encoder_type}")
         
         if self.encoder_type == 'both':
@@ -166,6 +183,26 @@ class DAGEncoder(nn.Module):
         )
         return dense_x, node_mask
 
+    def _apply_gat(self, graph_batch, max_num_nodes: int):
+        """GATv2 stack — identical data flow to _apply_gcn, different conv operator."""
+        if graph_batch is None:
+            raise ValueError("graph_batch is required for GAT-based encoders")
+
+        x = self.task_embedding(graph_batch.x)
+        edge_index = graph_batch.edge_index
+
+        for i, layer in enumerate(self.gat_layers):
+            x = layer(x, edge_index)
+            if i < len(self.gat_layers) - 1:
+                x = self.dropout(torch.relu(x))
+
+        dense_x, node_mask = to_dense_batch(
+            x,
+            graph_batch.batch,
+            max_num_nodes=max_num_nodes
+        )
+        return dense_x, node_mask
+
     def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None):
         """
         Args:
@@ -190,6 +227,11 @@ class DAGEncoder(nn.Module):
             if node_mask is None:
                 node_mask = gcn_mask
             encoded_streams.append(gcn_out)
+        if self.encoder_type == 'gat':
+            gat_out, gat_mask = self._apply_gat(graph_batch, task_features.size(1))
+            if node_mask is None:
+                node_mask = gat_mask
+            encoded_streams.append(gat_out)
 
         if self.encoder_type == 'both':
             out = self.hybrid_fusion(torch.cat(encoded_streams, dim=-1))
