@@ -350,7 +350,8 @@ class LowerLayerAgent:
         
         # Local optimizer (SGD for fast adaptation as per MAML)
         self.inner_lr = config.get('inner_lr', 0.01)
-        
+        self.clip_epsilon = config.get('clip_epsilon', 0.2)
+
         # Hypervolume tracking
         self.hv_threshold = config.get('hypervolume_threshold', 0.5)
         self.hv_window = config.get('moving_average_window', 50)
@@ -456,98 +457,124 @@ class LowerLayerAgent:
     
     def _compute_loss_with_params(self, params_dict: Dict, batch: List[Dict]) -> torch.Tensor:
         """
-        Compute loss using specific parameters (functional style)
+        Compute PPO-clipped loss using specific parameters (functional style).
+        Reads pre-computed GAE advantages and return targets from the experience dict.
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
+
         task_features_list = [exp['task_features'] for exp in batch]
         task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
         if len(task_features.shape) == 4:
             task_features = task_features.squeeze(1)
-        
+
         server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
         if len(server_features.shape) == 3:
             server_features = server_features.squeeze(1)
-            
+
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
-        mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+
+        # PPO inputs: old log probs and pre-computed GAE quantities
+        old_log_probs = torch.FloatTensor([exp['log_prob'] for exp in batch]).to(self.device)
+        advantages = torch.FloatTensor([exp['advantage'] for exp in batch]).to(self.device)
+        return_targets = torch.FloatTensor(
+            np.array([exp['return_target'] for exp in batch])
+        ).to(self.device)
+
+        # Normalise advantages across the mini-batch for training stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         # Forward pass with adapted parameters
         num_tasks = task_features.size(1)
         action_logits = self._forward_with_params(
             params_dict, task_features, server_features, preferences, num_tasks
         )
-        
-        # Policy loss
+
+        # New log probs under the (adapted) parameters
         logits = action_logits[:, 0, :]
         action_probs = torch.softmax(logits, dim=-1)
         dist = Categorical(action_probs)
-        log_probs = dist.log_prob(actions)
+        new_log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
-        
-        # Value prediction (using meta value network for simplicity)
+
+        # Value prediction
         values = self.meta_value(states, preferences)
-        
-        # Multi-objective advantages
-        advantages = mo_returns - values.detach()
-        weighted_advantages = (advantages * preferences).sum(dim=-1)
-        
-        # Combined loss
-        policy_loss = -(log_probs * weighted_advantages).mean()
-        value_loss = ((mo_returns - values) ** 2).sum(dim=-1).mean()
+
+        # 1. PPO clipped surrogate objective
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+
+        # 2. Value loss against GAE bootstrapped return targets
+        value_loss = ((return_targets - values) ** 2).sum(dim=-1).mean()
+
+        # 3. Entropy bonus
         entropy_loss = -entropy.mean()
-        
+
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
-        
+
         return total_loss
 
     def _compute_loss(self, batch: List[Dict]) -> torch.Tensor:
         """
-        Compute combined policy and value loss (using current meta-policy)
+        Compute PPO-clipped loss using the current meta-policy directly.
+        Reads pre-computed GAE advantages and return targets from the experience dict.
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
+
         task_features_list = [exp['task_features'] for exp in batch]
         task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
         if len(task_features.shape) == 4:
             task_features = task_features.squeeze(1)
-        
+
         server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
         if len(server_features.shape) == 3:
             server_features = server_features.squeeze(1)
-            
+
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
-        mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+
+        # PPO inputs: old log probs and pre-computed GAE quantities
+        old_log_probs = torch.FloatTensor([exp['log_prob'] for exp in batch]).to(self.device)
+        advantages = torch.FloatTensor([exp['advantage'] for exp in batch]).to(self.device)
+        return_targets = torch.FloatTensor(
+            np.array([exp['return_target'] for exp in batch])
+        ).to(self.device)
+
+        # Normalise advantages across the mini-batch for training stability
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         # Forward pass
         num_tasks = task_features.size(1)
         action_logits = self.meta_policy(task_features, server_features, preferences, num_tasks)
-        
-        # Policy loss
+
+        # New log probs
         logits = action_logits[:, 0, :]
         action_probs = torch.softmax(logits, dim=-1)
         dist = Categorical(action_probs)
-        log_probs = dist.log_prob(actions)
+        new_log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
-        
+
         # Value prediction
         values = self.meta_value(states, preferences)
-        
-        # Multi-objective advantages
-        advantages = mo_returns - values.detach()
-        weighted_advantages = (advantages * preferences).sum(dim=-1)
-        
-        # Combined loss
-        policy_loss = -(log_probs * weighted_advantages).mean()
-        value_loss = ((mo_returns - values) ** 2).sum(dim=-1).mean()
+
+        # 1. PPO clipped surrogate objective
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
+        policy_loss = -torch.min(surr1, surr2).mean()
+
+        # 2. Value loss against GAE bootstrapped return targets
+        value_loss = ((return_targets - values) ** 2).sum(dim=-1).mean()
+
+        # 3. Entropy bonus
         entropy_loss = -entropy.mean()
-        
+
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
-        
+
         return total_loss
     
     def update_performance(self, delay: float, energy: float):
@@ -817,7 +844,12 @@ class TAMPOFramework:
         # Create meta-learner with higher learning rate
         config['meta_learning_rate'] = 3e-3  # 10x higher
         config['inner_lr'] = 0.1  # 10x higher
-        
+        config['clip_epsilon'] = config.get('clip_epsilon', 0.2)
+        config['gae_lambda'] = config.get('gae_lambda', 0.95)
+        config['gamma'] = config.get('gamma', 0.99)
+        self.gamma = config['gamma']
+        self.gae_lambda = config['gae_lambda']
+
         self.meta_learner = HigherLayerMetaLearner(
             meta_policy=meta_policy,
             value_network=value_network,
@@ -961,52 +993,109 @@ class TAMPOFramework:
         }, path)
     
     def _collect_task_experiences(self, task_id: int, num_episodes: int = 10):
-        """Collect MORE experiences for better learning"""
+        """Collect experiences and annotate each step with GAE advantage and return target."""
         train_experiences = []
         test_experiences = []
-        
-        for ep in range(num_episodes):  # Increased from 5 to 10
+
+        for ep in range(num_episodes):
             preference = self._sample_preference()
-            
+
             state = self.env.reset(preference_vector=preference)
             done = False
             episode_exp = []
-            
+
             step_count = 0
-            max_steps = 50  # More steps per episode
-            
+            max_steps = 50
+
             while not done and step_count < max_steps:
                 task_features = self._extract_task_features(state)
                 server_features = self._extract_server_features(state)
-                
-                action = self._select_action(task_features, server_features, preference)
-                
+
+                action, log_prob = self._select_action(task_features, server_features, preference)
+
                 next_state, reward, done, info = self.env.step(action)
-                
+
                 exp = {
                     'state': state,
                     'task_features': task_features,
                     'server_features': server_features,
                     'action': action,
-                    'reward': reward,  # Use raw reward (already very strong signal)
+                    'reward': reward,
+                    'log_prob': log_prob,
                     'preference': preference,
                     'mo_return': np.array([info.get('delay', 0), info.get('energy', 0)]),
                     'next_state': next_state,
-                    'done': done
+                    'done': done,
                 }
                 episode_exp.append(exp)
-                
+
                 state = next_state
                 step_count += 1
-            
+
+            # Compute multi-objective GAE for this episode before splitting
+            if len(episode_exp) > 0:
+                self._compute_gae_for_episode(episode_exp, preference)
+
             # Split train/test 80/20
             if len(episode_exp) > 0:
                 split = max(1, int(len(episode_exp) * 0.8))
                 train_experiences.extend(episode_exp[:split])
                 test_experiences.extend(episode_exp[split:])
-        
+
         return train_experiences, test_experiences
     
+    def _compute_gae_for_episode(self, episode_exp: list, preference: np.ndarray):
+        """
+        Compute multi-objective GAE offline for one episode and annotate each
+        experience dict in-place with two new keys:
+
+          'advantage'     — scalar, preference-weighted GAE advantage
+          'return_target' — np.ndarray of shape (2,), GAE bootstrapped return
+                            for each objective; used as the value-loss target
+
+        Convention: mo_return stores per-step costs (delay, energy).  We negate
+        them to obtain rewards so that higher reward corresponds to a better
+        action, matching the standard PPO sign convention where a positive
+        advantage should increase the action probability.
+        """
+        T = len(episode_exp)
+        value_net = self.meta_learner.value_network
+
+        with torch.no_grad():
+            states = torch.FloatTensor(
+                np.array([exp['state'] for exp in episode_exp])
+            ).to(self.device)
+            next_states = torch.FloatTensor(
+                np.array([exp['next_state'] for exp in episode_exp])
+            ).to(self.device)
+            prefs = torch.FloatTensor(preference).unsqueeze(0).expand(T, -1).to(self.device)
+
+            values_t = value_net(states, prefs).cpu().numpy()       # [T, 2]
+            values_tp1 = value_net(next_states, prefs).cpu().numpy()  # [T, 2]
+
+        # Costs → rewards (negate so maximising reward = minimising cost)
+        costs = np.array([exp['mo_return'] for exp in episode_exp], dtype=np.float32)  # [T, 2]
+        rewards = -costs                                                                 # [T, 2]
+        dones = np.array([float(exp['done']) for exp in episode_exp], dtype=np.float32) # [T]
+
+        # Reverse-pass GAE (one pass covers both objectives simultaneously)
+        advantages = np.zeros((T, 2), dtype=np.float32)
+        gae = np.zeros(2, dtype=np.float32)
+
+        for t in reversed(range(T)):
+            mask = 1.0 - dones[t]
+            delta = rewards[t] + self.gamma * values_tp1[t] * mask - values_t[t]
+            gae = delta + self.gamma * self.gae_lambda * mask * gae
+            advantages[t] = gae
+
+        # GAE return = advantage + baseline; used as value-loss target
+        returns = advantages + values_t  # [T, 2]
+
+        # Annotate each experience with the scalar weighted advantage and 2D return
+        for t, exp in enumerate(episode_exp):
+            exp['advantage'] = float((advantages[t] * preference).sum())
+            exp['return_target'] = returns[t]  # shape (2,), kept as numpy
+
     def _sample_preference(self) -> np.ndarray:
         """Sample preference vector"""
         w_delay = np.random.uniform(0.2, 0.8)
@@ -1024,18 +1113,18 @@ class TAMPOFramework:
         return server_feat
     
     def _select_action(self, task_features, server_features, preference):
-        """Select action - minimal exploration needed with strong init"""
+        """Select action and return (action, log_prob) for PPO trajectory storage."""
         with torch.no_grad():
             task_tensor = torch.FloatTensor(task_features).to(self.device)
             server_tensor = torch.FloatTensor(server_features).to(self.device)
             pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
-            
+
             logits = self.agents[0].meta_policy(
                 task_tensor, server_tensor, pref_tensor, num_tasks=1
             )
-            
+
             probs = torch.softmax(logits[:, 0, :], dim=-1)
-            
+
             # Very minimal exploration (5%)
             if np.random.rand() < 0.05:
                 # Even in exploration, never choose local
@@ -1043,8 +1132,11 @@ class TAMPOFramework:
                 action = np.random.choice(len(weights), p=weights/weights.sum())
             else:
                 action = torch.argmax(probs, dim=-1).item()
-        
-        return action
+
+            # Log probability of the taken action under the current policy
+            log_prob = torch.log(probs.squeeze(0)[action] + 1e-10).item()
+
+        return action, log_prob
     
     def evaluate(self, num_episodes: int = 20):
         """Evaluate framework"""
@@ -1076,14 +1168,14 @@ class TAMPOFramework:
                 while not done and step_count < max_steps:
                     task_features = self._extract_task_features(state)
                     server_features = self._extract_server_features(state)
-                    
-                    action = self._select_action(task_features, server_features, pref)
-                    
+
+                    action, _ = self._select_action(task_features, server_features, pref)
+
                     state, reward, done, info = self.env.step(action)
-                    
+
                     episode_delay += info.get('delay', 0)
                     episode_energy += info.get('energy', 0)
-                    
+
                     step_count += 1
                 
                 delays.append(episode_delay)
