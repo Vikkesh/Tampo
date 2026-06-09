@@ -96,4 +96,4 @@ algorithms:
     enabled: true
     hidden_dims: [256, 256]
     num_attention_heads: 8
-    encoder_type: 'gcn'  # options: 'lstm', 'gcn', 'both'
+    encoder_type: 'gcn'  # Options: 'lstm', 'gcn'

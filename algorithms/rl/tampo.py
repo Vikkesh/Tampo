@@ -7,7 +7,7 @@ from torch.distributions import Categorical
 from torch.func import functional_call
 from torch_geometric.data import Batch, Data
 from torch_geometric.nn import GCNConv
-from torch_geometric.utils import to_dense_batch, to_undirected
+from torch_geometric.utils import to_dense_batch
 from collections import deque
 import copy
 import os
@@ -55,7 +55,7 @@ def _build_pyg_batch(
             edge_positions = torch.nonzero(adj > 0, as_tuple=False)
             if edge_positions.numel() > 0:
                 edge_index = edge_positions.t().contiguous().long()
-                edge_index = to_undirected(edge_index, num_nodes=num_nodes)
+                # Removed to_undirected to keep directed edges as per GDRL Feature.py
 
         data_list.append(Data(x=x, edge_index=edge_index, num_nodes=num_nodes))
 
@@ -71,7 +71,8 @@ class DAGEncoder(nn.Module):
         task_feature_dim: int,
         hidden_dim: int,
         num_layers: int = 2,
-        encoder_type: str = 'lstm'
+        encoder_type: str = 'lstm',
+        server_feature_dim: int = 20
     ):
         super(DAGEncoder, self).__init__()
         
@@ -95,7 +96,28 @@ class DAGEncoder(nn.Module):
                 bidirectional=True,
                 dropout=0.1 if num_layers > 1 else 0
             )
-        if self.encoder_type in {'gcn', 'both'}:
+        if self.encoder_type == 'gcn':
+            # GDRL Feature.py architecture mapping (Upgraded to Bi-Directional)
+            self.gnn1_fwd = GCNConv(task_feature_dim, 16)
+            self.gnn2_fwd = GCNConv(16, 1)
+            
+            self.gnn1_bwd = GCNConv(task_feature_dim, 16)
+            self.gnn2_bwd = GCNConv(16, 1)
+
+            fnn_in = server_feature_dim + 2
+            self.fnn1 = nn.Sequential(
+                nn.Linear(fnn_in, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+            )
+            self.fnn_out = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.ReLU(),
+                nn.Linear(64, hidden_dim * 2),
+                nn.ReLU()
+            )
+        elif self.encoder_type == 'both':
+            # Legacy both branch, kept for structural integrity if used elsewhere
             self.gcn_layers = nn.ModuleList([
                 GCNConv(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2)
                 for i in range(num_layers)
@@ -147,37 +169,88 @@ class DAGEncoder(nn.Module):
         return out
 
     def _apply_gcn(self, graph_batch, max_num_nodes: int):
-        """PyG GCN stack using the paper-standard edge_index graph format."""
+        """GDRL GCN forward pass (Cai et al. 2025, Feature.py)."""
         if graph_batch is None:
             raise ValueError("graph_batch is required for GCN-based encoders")
 
-        x = self.task_embedding(graph_batch.x)
-        edge_index = graph_batch.edge_index
+        if self.encoder_type == 'both':
+            x = self.task_embedding(graph_batch.x)
+            edge_index = graph_batch.edge_index
+            for i, layer in enumerate(self.gcn_layers):
+                x = layer(x, edge_index)
+                if i < len(self.gcn_layers) - 1:
+                    x = self.dropout(torch.relu(x))
+            dense_x, node_mask = to_dense_batch(
+                x,
+                graph_batch.batch,
+                max_num_nodes=max_num_nodes
+            )
+            return dense_x, node_mask
 
-        for i, layer in enumerate(self.gcn_layers):
-            x = layer(x, edge_index)
-            if i < len(self.gcn_layers) - 1:
-                x = self.dropout(torch.relu(x))
+        # GDRL 'gcn' path
+        import torch.nn.functional as F
+        x_list = []
+        # graph_batch.batch contains graph ID per node
+        unique_graphs = torch.unique(graph_batch.batch, sorted=True)
+        for graph_id in unique_graphs:
+            mask = graph_batch.batch == graph_id
+            x_i = graph_batch.x[mask]                      # [N_i, 6]
 
-        dense_x, node_mask = to_dense_batch(
-            x,
-            graph_batch.batch,
-            max_num_nodes=max_num_nodes
-        )
-        return dense_x, node_mask
+            # Extract local edge_index for this graph
+            node_offset = mask.nonzero(as_tuple=False)[0].item()
+            local_edges_fwd = graph_batch.edge_index[:, 
+                (graph_batch.edge_index[0] >= node_offset) & 
+                (graph_batch.edge_index[0] < node_offset + x_i.size(0))
+            ] - node_offset
+            
+            local_edges_bwd = local_edges_fwd[[1, 0]]
 
-    def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None):
+            # Forward pass
+            x_fwd = self.gnn1_fwd(x_i, local_edges_fwd)
+            x_fwd = F.relu(x_fwd)
+            x_fwd = F.dropout(x_fwd, training=self.training)
+            x_fwd = self.gnn2_fwd(x_fwd, local_edges_fwd).squeeze(1)  # [N_i]
+            
+            # Backward pass
+            x_bwd = self.gnn1_bwd(x_i, local_edges_bwd)
+            x_bwd = F.relu(x_bwd)
+            x_bwd = F.dropout(x_bwd, training=self.training)
+            x_bwd = self.gnn2_bwd(x_bwd, local_edges_bwd).squeeze(1)  # [N_i]
+
+            # Mean pool both streams and combine
+            summary = torch.stack([x_fwd.mean(), x_bwd.mean()]) # [2]
+            x_list.append(summary)
+
+        # Return the aggregated graphs, node_mask is None since we bypass attention
+        return torch.stack(x_list).unsqueeze(1), None
+
+    def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None, server_features=None):
         """
         Args:
             task_features: [batch, num_tasks, feature_dim]
             adjacency_matrix: [batch, num_tasks, num_tasks] optional
             node_mask: [batch, num_tasks] optional
             graph_batch: PyG Batch for GCN-based encoders
+            server_features: [batch, server_feature_dim] optional, required for 'gcn'
         
         Returns:
             encoded_tasks: [batch, num_tasks, hidden_dim * 2]
             context: [batch, hidden_dim * 2]
         """
+        if self.encoder_type == 'gcn':
+            if server_features is None:
+                raise ValueError("server_features is required for GDRL GCN path")
+            graph_summary, _ = self._apply_gcn(graph_batch, task_features.size(1))  # [batch, 1, 2]
+            graph_summary = graph_summary.squeeze(1)             # [batch, 2]
+            combined = torch.cat([server_features, graph_summary], dim=-1)  # [batch, server_dim+2]
+            out = self.fnn1(combined)                            # [batch, 64]
+            context = self.fnn_out(out)                          # [batch, hidden_dim*2]
+            
+            # The decoder in GCN mode only uses context, encoded_tasks can be empty
+            # but needs to be [batch, max_num_nodes, hidden_dim*2] to not crash
+            encoded_tasks = torch.zeros(task_features.size(0), task_features.size(1), context.size(-1), device=context.device)
+            return encoded_tasks, context
+
         embedded = self.task_embedding(task_features)
         if node_mask is not None:
             embedded = embedded * node_mask.unsqueeze(-1).float()
@@ -185,7 +258,7 @@ class DAGEncoder(nn.Module):
         encoded_streams = []
         if self.encoder_type in {'lstm', 'both'}:
             encoded_streams.append(self._apply_lstm(embedded, node_mask))
-        if self.encoder_type in {'gcn', 'both'}:
+        if self.encoder_type == 'both':
             gcn_out, gcn_mask = self._apply_gcn(graph_batch, task_features.size(1))
             if node_mask is None:
                 node_mask = gcn_mask
@@ -317,7 +390,8 @@ class MetaPolicyNetwork(nn.Module):
         self.hidden_dim = hidden_dim
         
         self.encoder = DAGEncoder(
-            task_feature_dim, hidden_dim, num_encoder_layers, encoder_type=encoder_type
+            task_feature_dim, hidden_dim, num_encoder_layers, encoder_type=encoder_type,
+            server_feature_dim=server_feature_dim
         )
         
         self.decoder = PreferenceConditionedDecoder(
@@ -351,7 +425,8 @@ class MetaPolicyNetwork(nn.Module):
             task_features,
             adjacency,
             node_mask,
-            graph_batch=graph_batch
+            graph_batch=graph_batch,
+            server_features=server_features
         )
         
         server_encoded = self.server_encoder(server_features)
