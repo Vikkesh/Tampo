@@ -75,8 +75,13 @@ def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir):
         print("\nNo results collected. Train at least one algorithm first.")
         return
 
-    _save_csv(results, output_dir)
-    _plot_results(results, output_dir)
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_output_dir = os.path.join(output_dir, f"run_{timestamp}")
+    os.makedirs(run_output_dir, exist_ok=True)
+    
+    _save_csv(results, run_output_dir)
+    _plot_results(results, run_output_dir)
     _print_summary_table(results, evaluator)
 
 
