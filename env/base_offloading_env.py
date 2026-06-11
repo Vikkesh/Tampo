@@ -1,7 +1,7 @@
 import copy
 import numpy as np
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from typing import Dict, List, Tuple, Optional
 import json
 
@@ -320,6 +320,13 @@ class TaskOffloadingEnv(gym.Env):
         self.total_energy = 0
         self.completed_tasks = 0
         
+        # DAG physics timeline tracking
+        self.node_finish_times = None
+        self.node_assignments = None
+        self.server_available = np.zeros(self.num_servers)
+        self.current_node_idx = 0
+        self.topo_order = None
+        
         # Update channel gains
         self._update_channel_gains()
         
@@ -332,6 +339,15 @@ class TaskOffloadingEnv(gym.Env):
         
         if self.selected_task_template is not None:
             self.current_task = copy.deepcopy(self.selected_task_template)
+            if self._is_dag_task():
+                num_nodes = len(self.current_task['tasks'])
+                self.node_finish_times = np.zeros(num_nodes)
+                self.node_assignments = [-1] * num_nodes
+                # Get topo order using the adjacency matrix depths to resolve dependencies safely
+                adj = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
+                # Sort by depth (upward-like rank proxy) to guarantee parents before children
+                depths = self._compute_topological_depths(adj)
+                self.topo_order = np.argsort(depths).tolist()
         else:
             self.current_task = self._generate_task()
         
@@ -348,54 +364,99 @@ class TaskOffloadingEnv(gym.Env):
     
     def _execute_offloading(self, action: int) -> Tuple[float, float]:
         """
-        Execute offloading decision and return delay and energy
-        using a moderate trade-off structure suitable for algorithm comparison.
+        Execute DAG node offloading and compute exact start and finish times.
+        Returns delay and energy for this node.
         """
-        task_size = self.current_task['size']
-        task_cycles = self.current_task['cycles']
+        if not self._is_dag_task():
+            # Fallback for independent tasks
+            task_size = self.current_task['size']
+            task_cycles = self.current_task['cycles']
+            if action == 0:
+                delay = task_cycles / self.local_freq
+                energy = self.kappa * task_cycles * (self.local_freq ** 2)
+            elif action == 1:
+                datarate_up = self._get_datarate(0)
+                trans_up = task_size / max(datarate_up, 1e-9)
+                delay = trans_up + (task_cycles / self.cloud_freq) + (task_size * 0.05) / max(datarate_up, 1e-9)
+                energy = (trans_up + (task_size * 0.05) / max(datarate_up, 1e-9)) * self.cloud_power_tx
+            else:
+                s_idx = action - 1
+                edge_idx = action - 2
+                if edge_idx >= len(self.edge_freq): edge_idx = 0
+                datarate_up = self._get_datarate(s_idx) * 1.5
+                trans_up = task_size / max(datarate_up, 1e-9)
+                delay = trans_up + (task_cycles / self.edge_freq[edge_idx]) + (task_size * 0.05) / max(datarate_up, 1e-9)
+                energy = (trans_up + (task_size * 0.05) / max(datarate_up, 1e-9)) * self.edge_power_tx
+            return delay, energy
+
+        # Extract current DAG node
+        node_id = self.topo_order[self.current_node_idx]
+        node_task = self.current_task['tasks'][node_id]
+        data_size = node_task.get('data_size', 1e6)
+        cycles = node_task.get('cycles', 1e9)
+
+        # 1. Find data-ready time from parents
+        data_ready = 0.0
+        edges = self.current_task.get('edges', [])
         
-        if action == 0:  # Local execution
-            delay = task_cycles / self.local_freq
-            energy = self.kappa * task_cycles * (self.local_freq ** 2)
-            
-        elif action == 1:  # Cloud offloading
-            datarate_up = self._get_datarate(0)
-            trans_delay_up = task_size / max(datarate_up, 1e-9)
-            
-            comp_delay = task_cycles / self.cloud_freq
-            
-            datarate_down = self._get_datarate(0)
-            trans_delay_down = (task_size * 0.05) / max(datarate_down, 1e-9)
-            
-            delay = trans_delay_up + comp_delay + trans_delay_down
-            
-            energy = (trans_delay_up + trans_delay_down) * self.cloud_power_tx
-            
-            self.server_loads[0] += 0.1
-            
-        else:  # Edge offloading
-            edge_idx = action - 2
-            if edge_idx >= len(self.edge_freq):
-                edge_idx = 0
-            server_idx = edge_idx + 1
-            
-            datarate_up = self._get_datarate(server_idx) * 1.5
-            trans_delay_up = task_size / max(datarate_up, 1e-9)
-            
-            comp_delay = task_cycles / self.edge_freq[edge_idx]
-            
-            datarate_down = self._get_datarate(server_idx) * 1.5
-            trans_delay_down = (task_size * 0.05) / max(datarate_down, 1e-9)
-            
-            delay = trans_delay_up + comp_delay + trans_delay_down
-            
-            energy = (trans_delay_up + trans_delay_down) * self.edge_power_tx
-            
-            self.server_loads[server_idx] += 0.1
-        
-        self.server_loads *= 0.98
-        
-        return delay, energy
+        # Server bandwidth parameters
+        server_idx = action
+        if server_idx == 0:
+            bw_up = self.bandwidth_up  # Local doesn't use bw_up for compute, but for sending out
+        else:
+            bw_up = self._get_datarate(0) if server_idx == 1 else self._get_datarate(server_idx - 1) * 1.5
+
+        cross_server_energy = 0.0
+
+        for edge in edges:
+            if edge['target'] == node_id:
+                parent_id = edge['source']
+                parent_finish = self.node_finish_times[parent_id]
+                parent_server = self.node_assignments[parent_id]
+                
+                if parent_server == server_idx:
+                    comm_cost = 0.0
+                else:
+                    comm_data = float(edge.get('data', 0))
+                    comm_cost = comm_data / max(bw_up, 1e-9)
+                    # Add transmission energy penalty for cross-server
+                    if parent_server == 1:
+                        cross_server_energy += comm_cost * self.cloud_power_tx
+                    elif parent_server > 1:
+                        cross_server_energy += comm_cost * self.edge_power_tx
+                    
+                data_ready = max(data_ready, parent_finish + comm_cost)
+
+        # 2. Earliest start time (when dependencies are met AND processor is free)
+        start_time = max(data_ready, self.server_available[server_idx])
+
+        # 3. Computation delay
+        if server_idx == 0:
+            comp_delay = cycles / self.local_freq
+        elif server_idx == 1:
+            comp_delay = cycles / self.cloud_freq
+        else:
+            edge_idx = server_idx - 2
+            if edge_idx >= len(self.edge_freq): edge_idx = 0
+            comp_delay = cycles / self.edge_freq[edge_idx]
+
+        finish_time = start_time + comp_delay
+
+        # 4. Record state updates
+        self.node_finish_times[node_id] = finish_time
+        self.node_assignments[node_id] = server_idx
+        self.server_available[server_idx] = finish_time
+
+        # 5. Energy calculation
+        if server_idx == 0:
+            energy = self.kappa * cycles * (self.local_freq ** 2)
+        else:
+            trans_time = data_size / max(bw_up, 1e-9)
+            result_time = (data_size * 0.05) / max(bw_up, 1e-9)
+            power = self.cloud_power_tx if server_idx == 1 else self.edge_power_tx
+            energy = (trans_time + result_time) * power + cross_server_energy
+
+        return comp_delay, energy
     
     def _get_datarate(self, server_idx: int) -> float:
         """Calculate datarate to server"""
@@ -467,21 +528,54 @@ class TaskOffloadingEnv(gym.Env):
     
     def _calculate_reward(self, delay: float, energy: float) -> float:
         """
-        Moderately shaped reward based on preference-weighted improvement over
-        local execution, clipped to keep learning stable without dictating the
-        optimal action family in advance.
+        Calculates dense reward combining local improvement, server congestion, and communication penalties.
         """
-        # Calculate what local execution would cost
-        local_delay = self.current_task['cycles'] / self.local_freq
-        local_energy = self.kappa * self.current_task['cycles'] * (self.local_freq ** 2)
+        # Load weights from config
+        reward_cfg = self.config.get('reward', {})
+        w_cong = _coerce_float(reward_cfg.get('congestion_penalty_weight', 0.4), 0.4)
+        w_comm = _coerce_float(reward_cfg.get('comm_penalty_weight', 0.3), 0.3)
         
-        # Improvement ratio (how much better than local)
-        delay_improvement = (local_delay - delay) / local_delay
-        energy_improvement = (local_energy - energy) / local_energy
+        if not self._is_dag_task():
+            # Fallback for independent tasks
+            local_delay = self.current_task['cycles'] / self.local_freq
+            local_energy = self.kappa * self.current_task['cycles'] * (self.local_freq ** 2)
+            d_imp = (local_delay - delay) / max(local_delay, 1e-9)
+            e_imp = (local_energy - energy) / max(local_energy, 1e-9)
+            return float(np.clip(5.0 * (self.preference[0] * d_imp + self.preference[1] * e_imp), -5.0, 5.0))
+
+        # True DAG reward
+        node_id = self.topo_order[self.current_node_idx]
+        node_task = self.current_task['tasks'][node_id]
+        cycles = node_task.get('cycles', 1e9)
+        action = self._last_action
         
-        # Weighted improvement
-        total_improvement = (self.preference[0] * delay_improvement + 
-                            self.preference[1] * energy_improvement)
+        # 1. Computation Improvement vs Local
+        local_delay = cycles / self.local_freq
+        local_energy = self.kappa * cycles * (self.local_freq ** 2)
+        
+        comp_imp = (local_delay - delay) / max(local_delay, 1e-9)
+        e_imp = (local_energy - energy) / max(local_energy, 1e-9)
+        
+        # 2. Congestion Penalty (Are we stacking load on this server?)
+        # Measure how long this task had to wait in the server's queue
+        wait_time = self.server_available[action] - self.node_finish_times[node_id] + delay
+        wait_time = max(0.0, wait_time)
+        congestion_penalty = min(wait_time / 5.0, 1.0)  # Max penalty if waited > 5 seconds
+        
+        # 3. Communication Penalty (Cross-server edges)
+        comm_penalty = 0.0
+        edges = self.current_task.get('edges', [])
+        for edge in edges:
+            if edge['target'] == node_id:
+                parent_id = edge['source']
+                if self.node_assignments[parent_id] != action:
+                    comm_data = float(edge.get('data', 0))
+                    comm_penalty += comm_data / max(self.bandwidth_up, 1e-9)
+        comm_penalty = min(comm_penalty, 1.0)
+
+        # Combine
+        combined_delay_metric = comp_imp - (w_cong * congestion_penalty) - (w_comm * comm_penalty)
+        total_improvement = self.preference[0] * combined_delay_metric + self.preference[1] * e_imp
 
         reward = float(np.clip(5.0 * total_improvement, -5.0, 5.0))
         return reward
@@ -493,23 +587,28 @@ class TaskOffloadingEnv(gym.Env):
         # Store action for reward calculation
         self._last_action = action
         
-        # Execute offloading decision
+        # Execute offloading decision for the current node
         delay, energy = self._execute_offloading(action)
         
-        # Update metrics
-        self.total_delay += delay
+        # Calculate reward based on node-level metrics
+        reward = self._calculate_reward(delay, energy)
+        
+        # Update running metrics
         self.total_energy += energy
         self.completed_tasks += 1
         
-        # Calculate reward based on preference vector
-        reward = self._calculate_reward(delay, energy)
-        
-        # Update state
-        self.current_step += 1
-        done = self._is_dag_task() or self.current_step >= self.max_steps
-        
-        if not done:
-            self.current_task = self._generate_task()
+        # Update DAG state
+        if self._is_dag_task():
+            self.current_node_idx += 1
+            done = self.current_node_idx >= len(self.current_task['tasks'])
+            if done:
+                self.total_delay = max(self.node_finish_times)
+        else:
+            self.total_delay += delay
+            self.current_step += 1
+            done = self.current_step >= self.max_steps
+            if not done:
+                self.current_task = self._generate_task()
         
         # Get next observation
         obs = self._get_observation()
@@ -519,9 +618,10 @@ class TaskOffloadingEnv(gym.Env):
             'delay': delay,
             'energy': energy,
             'total_delay': self.total_delay,
+            'makespan': self.total_delay,
             'total_energy': self.total_energy,
             'completed_tasks': self.completed_tasks,
-            'server_loads': self.server_loads.copy()
+            'server_loads': self.server_available.copy()  # Reflect actual load via availability times
         }
         
         return obs, reward, done, info

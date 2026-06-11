@@ -78,12 +78,10 @@ Since execution happens in Colab:
 ## 6. Project Documentation & README Updates
 
 ### Note
-**Keep a detailed/ unshortened version of all the changes that are made in that particular lasrge scale update in the folder "dev_logs" and the file "dev_logs/ .md" in complete details. If 2 log files are associated have only a single "dev_log .md" file and merge them.**
+**Keep a detailed/ unshortened version of all the changes that are made in that particular large scale update in the folder "dev_logs" and the file "dev_logs/ .md" in complete details. If 2 log files are associated have only a single "dev_log .md" file and merge them.**
 
-Whenever you implement a new algorithm, wrapper, or framework component, you MUST update the global [README.md](file:///README.md) file to explain everything about the project as it evolves in a brief, effecient manner.
+Whenever you implement a new algorithm, wrapper, framework component, or updates to any core component's logic like physics engine, reward system, you MUST update the global [README.md](file:///README.md) file to explain everything about the project as it evolves in a brief, effecient manner.
 
 Specifically:
 - Maintain a dedicated section in [README.md](file:///README.md) detailing **how to switch between the implemented algorithms** and **how to run all of them** (both training in Colab and local benchmarking).
 - Document new baselines, configuration toggles, wrappers, and dataset paths.
-
-

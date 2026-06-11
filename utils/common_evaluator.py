@@ -147,8 +147,8 @@ class CommonEvaluator:
                     next_state, reward, done, info = self.env.step(action)
                     
                     # Accumulate metrics
-                    episode_delay += info.get('delay', 0)
-                    episode_energy += info.get('energy', 0)
+                    episode_delay = info.get('makespan', info.get('total_delay', 0))
+                    episode_energy = info.get('total_energy', 0)
                     
                     state = next_state
                     steps += 1
@@ -159,7 +159,7 @@ class CommonEvaluator:
         # Calculate metrics
         result = self._calculate_metrics(delays, energies)
         
-        print(f"  ✓ Avg Delay: {result['avg_delay']:.4f}s")
+        print(f"  ✓ Avg Makespan: {result['avg_makespan']:.4f}s")
         print(f"  ✓ Avg Energy: {result['avg_energy']:.4f}J")
         
         return result
@@ -236,11 +236,11 @@ class CommonEvaluator:
             valid_energies = energies[valid_mask]
         
         metrics = {
-            'avg_delay': np.mean(valid_delays),
-            'std_delay': np.std(valid_delays),
-            'min_delay': np.min(valid_delays),
-            'max_delay': np.max(valid_delays),
-            'median_delay': np.median(valid_delays),
+            'avg_makespan': np.mean(valid_delays),
+            'std_makespan': np.std(valid_delays),
+            'min_makespan': np.min(valid_delays),
+            'max_makespan': np.max(valid_delays),
+            'median_makespan': np.median(valid_delays),
             
             'avg_energy': np.mean(valid_energies),
             'std_energy': np.std(valid_energies),
@@ -266,7 +266,7 @@ class CommonEvaluator:
         print("="*100)
         
         # Header
-        print(f"\n{'Algorithm':<15} {'Avg Delay':<12} {'Std Delay':<12} {'Avg Energy':<12} {'Std Energy':<12} {'Episodes':<10}")
+        print(f"\n{'Algorithm':<15} {'Avg Makespan':<12} {'Std Makespan':<12} {'Avg Energy':<12} {'Std Energy':<12} {'Episodes':<10}")
         print("-" * 100)
         
         # Rows
@@ -274,8 +274,8 @@ class CommonEvaluator:
             if metrics is None:
                 continue
             print(f"{alg_name:<15} "
-                  f"{metrics['avg_delay']:<12.4f} "
-                  f"{metrics['std_delay']:<12.4f} "
+                  f"{metrics['avg_makespan']:<12.4f} "
+                  f"{metrics['std_makespan']:<12.4f} "
                   f"{metrics['avg_energy']:<12.4f} "
                   f"{metrics['std_energy']:<12.4f} "
                   f"{metrics['num_episodes']:<10}")
@@ -286,15 +286,15 @@ class CommonEvaluator:
         valid_results = {k: v for k, v in results.items() if v is not None}
         
         if len(valid_results) > 0:
-            best_delay = min(valid_results.items(), key=lambda x: x[1]['avg_delay'])
+            best_delay = min(valid_results.items(), key=lambda x: x[1]['avg_makespan'])
             best_energy = min(valid_results.items(), key=lambda x: x[1]['avg_energy'])
             
-            print(f"\n🏆 Best Delay:  {best_delay[0]:<15} ({best_delay[1]['avg_delay']:.4f}s)")
-            print(f"🏆 Best Energy: {best_energy[0]:<15} ({best_energy[1]['avg_energy']:.4f}J)")
+            print(f"\n🏆 Best Makespan:  {best_delay[0]:<15} ({best_delay[1]['avg_makespan']:.4f}s)")
+            print(f"🏆 Best Energy:    {best_energy[0]:<15} ({best_energy[1]['avg_energy']:.4f}J)")
             
             # Best balanced (using equal weights)
             best_balanced = min(valid_results.items(), 
-                              key=lambda x: 0.5 * x[1]['avg_delay'] / 10.0 + 0.5 * x[1]['avg_energy'])
+                              key=lambda x: 0.5 * x[1]['avg_makespan'] / 10.0 + 0.5 * x[1]['avg_energy'])
             print(f"🏆 Best Balanced: {best_balanced[0]:<15}")
         
         print("\n" + "="*100 + "\n")

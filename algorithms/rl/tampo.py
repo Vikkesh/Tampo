@@ -1229,7 +1229,8 @@ class TAMPOFramework:
             done = False
             
             step_count = 0
-            max_steps = 50  # More steps per episode
+            num_nodes = len(self.env.current_task['tasks']) if self.env._is_dag_task() else 50
+            max_steps = num_nodes
             
             while not done and step_count < max_steps:
                 task_features = self._extract_task_features(state)
@@ -1403,17 +1404,18 @@ class TAMPOFramework:
                 episode_energy = 0
                 
                 step_count = 0
-                max_steps = 50
+                num_nodes = len(self.env.current_task['tasks']) if self.env._is_dag_task() else 50
+                max_steps = num_nodes
                 
                 while not done and step_count < max_steps:
                     action = self.select_action(state, pref, deterministic=True)
                     
                     state, reward, done, info = self.env.step(action)
                     
-                    episode_delay += info.get('delay', 0)
-                    episode_energy += info.get('energy', 0)
-                    
                     step_count += 1
+                
+                episode_delay = info.get('makespan', self.env.total_delay)
+                episode_energy = info.get('total_energy', self.env.total_energy)
                 
                 delays.append(episode_delay)
                 energies.append(episode_energy)

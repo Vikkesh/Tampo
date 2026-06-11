@@ -88,7 +88,7 @@ def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir):
 def _save_csv(results: dict, output_dir: str):
     import csv
     csv_path = os.path.join(output_dir, "benchmark_results.csv")
-    fieldnames = ['algorithm', 'avg_delay', 'std_delay', 'min_delay', 'max_delay',
+    fieldnames = ['algorithm', 'avg_makespan', 'std_makespan', 'min_makespan', 'max_makespan',
                   'avg_energy', 'std_energy', 'min_energy', 'max_energy', 'num_episodes']
     with open(csv_path, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -108,15 +108,15 @@ def _plot_results(results: dict, output_dir: str):
         return
 
     algos = list(valid.keys())
-    avg_delays = [valid[a]['avg_delay'] for a in algos]
+    avg_delays = [valid[a]['avg_makespan'] for a in algos]
     avg_energies = [valid[a]['avg_energy'] for a in algos]
     x = np.arange(len(algos))
     width = 0.35
 
     # ── Bar Chart ────────────────────────────────────────────────
     fig, ax1 = plt.subplots(figsize=(max(8, len(algos) * 2), 6))
-    bars1 = ax1.bar(x - width / 2, avg_delays, width, label='Avg Delay (s)', color='steelblue')
-    ax1.set_ylabel('Average Delay (s)', color='steelblue')
+    bars1 = ax1.bar(x - width / 2, avg_delays, width, label='Avg Makespan (s)', color='steelblue')
+    ax1.set_ylabel('Average Makespan (s)', color='steelblue')
     ax1.tick_params(axis='y', labelcolor='steelblue')
     ax1.set_xticks(x)
     ax1.set_xticklabels(algos, rotation=30, ha='right')
@@ -142,7 +142,7 @@ def _plot_results(results: dict, output_dir: str):
         ax.annotate(algo, (avg_delays[i], avg_energies[i]),
                     textcoords="offset points", xytext=(6, 4), fontsize=9)
 
-    ax.set_xlabel('Average Delay (s)')
+    ax.set_xlabel('Average Makespan (s)')
     ax.set_ylabel('Average Energy (J)')
     ax.set_title('Performance Trade-off: Pareto Front')
     ax.grid(True, linestyle='--', alpha=0.5)

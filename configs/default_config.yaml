@@ -43,6 +43,12 @@ tasks:
   task_cycles_range: [1000000000.0, 10000000000.0]  # cycles
   task_type: 'dag'  # 'dag' or 'independent'
   
+# Reward Configuration
+reward:
+  congestion_penalty_weight: 0.4
+  comm_penalty_weight: 0.3
+  improvement_baseline: 'local'
+  
   # DAG task parameters
   dag:
     num_tasks_range: [10, 30]

@@ -2,66 +2,52 @@ import os
 import sys
 import json
 import argparse
-import yaml
+from utils.dag_parser import DAGParser
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from env.base_offloading_env import TaskOffloadingEnv
-
-
-def _load_config():
-    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                               'configs', 'default_config.yaml')
-    with open(config_path, 'r') as f:
-        full_config = yaml.safe_load(f)
-
-    config = {}
-    for section in ('system', 'computing', 'energy', 'network', 'tasks'):
-        config.update(full_config['environment'][section])
-    return config
-
 
 def generate_golden_dataset(num_dags: int, output_file: str):
-    print(f"Generating Golden Dataset of {num_dags} DAGs...")
+    print(f"Generating Golden Dataset of {num_dags} DAGs from meta_offloading_n...")
 
-    config = _load_config()
-    env = TaskOffloadingEnv(config)
-
+    # Load from meta_offloading_n — variable-size graphs for better generalisation testing
+    folders = [
+        'data/meta_offloading_n/offload_random10',
+        'data/meta_offloading_n/offload_random20',
+        'data/meta_offloading_n/offload_random30',
+        'data/meta_offloading_n/offload_random40',
+        'data/meta_offloading_n/offload_random50',
+    ]
+    
+    # Sample equally from each size
+    per_folder = max(1, num_dags // len(folders))
     dataset = []
-    np_seed = 0
+    
+    for folder in folders:
+        try:
+            parser = DAGParser(folder)
+            graphs = parser.load_dataset(num_graphs=per_folder)
+            dataset.extend(graphs)
+            print(f"Loaded {len(graphs)} graphs from {folder}")
+        except Exception as e:
+            print(f"Warning: Failed to load from {folder}: {e}")
 
-    while len(dataset) < num_dags:
-        import numpy as np
-        np.random.seed(np_seed)
-        np_seed += 1
+    # Serialise numpy arrays to plain Python so json.dump works
+    def _serialise(obj):
+        if hasattr(obj, 'tolist'):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _serialise(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_serialise(i) for i in obj]
+        return obj
 
-        # reset() internally calls _generate_task() which may produce a DAG when
-        # task_type == 'dag'.  We collect whatever task was generated.
-        env.reset()
-        task = env.current_task
-
-        if task is None:
-            continue
-
-        # Serialise numpy arrays to plain Python so json.dump works.
-        def _serialise(obj):
-            if hasattr(obj, 'tolist'):
-                return obj.tolist()
-            if isinstance(obj, dict):
-                return {k: _serialise(v) for k, v in obj.items()}
-            if isinstance(obj, (list, tuple)):
-                return [_serialise(i) for i in obj]
-            return obj
-
-        dataset.append(_serialise(task))
-
-        if len(dataset) % 50 == 0:
-            print(f"  Generated {len(dataset)}/{num_dags} DAGs...")
+    serialised_dataset = [_serialise(task) for task in dataset[:num_dags]]
 
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     with open(output_file, 'w') as f:
-        json.dump(dataset, f, indent=2)
+        json.dump(serialised_dataset, f, indent=2)
 
-    print(f"Dataset saved → {output_file}")
+    print(f"\nDataset of {len(serialised_dataset)} DAGs saved → {output_file}")
 
 
 if __name__ == "__main__":

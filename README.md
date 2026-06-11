@@ -6,6 +6,30 @@ This repository implements a **fair, unified benchmarking framework** for compar
 
 All algorithms share the same physics engine (`TaskOffloadingEnv`), the same immutable test dataset (`data/test_dags.json`), and the same evaluation metrics. No algorithm calculates its own latency or energy — all physics are handled by the environment.
 
+### ⚙️ How It Works: Physics Engine & Reward System
+
+The heart of this benchmarking framework is the `TaskOffloadingEnv`, which simulates the physical constraints of Edge/Cloud networks while enforcing a strict, multi-objective evaluation schema. 
+
+#### 1. True DAG-Aware Physics Engine
+Most standard offloading environments treat tasks as independent or evaluate them sequentially without topological consideration. This framework implements a true Directed Acyclic Graph (DAG) physics engine to ensure fair comparison between architectures:
+
+*   **Topological Stepping (Kahn's Algorithm):** Instead of processing nodes sequentially by ID, the environment utilizes Kahn's algorithm to resolve task dependencies. The agent interacts with the environment precisely in the order of graph execution depth. 
+*   **Dependency Blockers:** A task cannot begin computation until **all** of its parent tasks have finished their execution *and* successfully transmitted their output data across the network to the current server.
+*   **Dynamic Server Queues:** The engine maintains an internal `server_available` timeline for every device in the network. If an agent dumps multiple tasks onto the Cloud server simultaneously, the tasks will physically queue up, heavily delaying the start time of the later tasks. 
+*   **Global Makespan Calculation:** The absolute standard metric for DAG scheduling. The environment calculates the *Makespan*—the total time required from the start of the first node to the completion of the final node. No algorithm calculates its own delay; the environment acts as the absolute ground truth.
+
+#### 2. The Three-Component Penalty Reward System
+Because standard DRL agents tend to collapse into "lazy" local minimum policies (e.g., exclusively offloading to the Cloud), the reward system applies distinct pressures to force the agent to balance trade-offs. The total reward combines:
+
+1.  🚀 **Computation Improvement (The Carrot):** The environment calculates how much faster a task runs on the selected server compared to the baseline of running it locally on the mobile device. 
+2.  🚦 **Server Congestion Penalty (The Stick):** If an agent repeatedly chooses the same high-powered server (e.g., the Cloud), it is aggressively penalized based on the current length of that server's queue. This forces the agent to dynamically distribute load across Edge and Local devices.
+3.  📡 **Communication Penalty (The Stick):** If two tightly coupled tasks (a parent and its child) are scheduled on different machines, the agent receives a strict penalty corresponding to the data transmission overhead. This encourages algorithms to group dependent tasks together logically.
+
+#### 3. User Preference Alignment (MORL)
+As demonstrated in the TAMPO framework, the reward system dynamically adapts to user priorities via a **Preference Vector** `[w_delay, w_energy]`.
+*   During training, the environment randomizes this vector, forcing the Meta-RL agent to learn a generalized policy.
+*   During benchmarking, the algorithms are fed specific profiles (e.g., `[0.8, 0.2]` for Performance Mode, `[0.2, 0.8]` for Battery Saver Mode) to evaluate their zero-shot adaptability.
+
 ---
 
 ## Project Structure
