@@ -2,9 +2,9 @@ import os
 import sys
 import json
 import argparse
-from utils.dag_parser import DAGParser
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.dag_parser import DAGParser
 
 def generate_golden_dataset(num_dags: int, output_file: str):
     print(f"Generating Golden Dataset of {num_dags} DAGs from meta_offloading_n...")
