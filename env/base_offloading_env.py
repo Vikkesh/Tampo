@@ -490,10 +490,23 @@ class TaskOffloadingEnv(gym.Env):
         if self.current_task is None:
             return np.zeros(self.observation_space.shape[0])
         
+        if self._is_dag_task():
+            if self.current_node_idx < len(self.current_task['tasks']):
+                node_id = self.topo_order[self.current_node_idx]
+                node_task = self.current_task['tasks'][node_id]
+                task_size = node_task.get('data_size', 1e6)
+                task_cycles = node_task.get('cycles', 1e9)
+            else:
+                task_size = 0.0
+                task_cycles = 0.0
+        else:
+            task_size = self.current_task.get('size', 0.0)
+            task_cycles = self.current_task.get('cycles', 0.0)
+
         # Normalize task features
-        task_size_norm = (self.current_task['size'] - self.task_size_range[0]) / \
+        task_size_norm = (task_size - self.task_size_range[0]) / \
                          (self.task_size_range[1] - self.task_size_range[0])
-        task_cycles_norm = (self.current_task['cycles'] - self.task_cycles_range[0]) / \
+        task_cycles_norm = (task_cycles - self.task_cycles_range[0]) / \
                            (self.task_cycles_range[1] - self.task_cycles_range[0])
         
         if self._is_dag_task():
@@ -630,8 +643,11 @@ class TaskOffloadingEnv(gym.Env):
         """Render environment state"""
         if mode == 'human':
             print(f"\nStep: {self.current_step}")
-            print(f"Task: Size={self.current_task['size']/1e6:.2f}MB, "
-                  f"Cycles={self.current_task['cycles']/1e9:.2f}GHz")
+            if self._is_dag_task():
+                print(f"DAG Task with {len(self.current_task['tasks'])} nodes. Current node idx: {self.current_node_idx}")
+            else:
+                print(f"Task: Size={self.current_task.get('size', 0)/1e6:.2f}MB, "
+                      f"Cycles={self.current_task.get('cycles', 0)/1e9:.2f}GHz")
             print(f"Server Loads: {self.server_loads}")
             print(f"Total Delay: {self.total_delay:.4f}s")
             print(f"Total Energy: {self.total_energy:.4f}J")
