@@ -323,7 +323,7 @@ class TaskOffloadingEnv(gym.Env):
         # DAG physics timeline tracking
         self.node_finish_times = None
         self.node_assignments = None
-        self.server_available = np.zeros(self.num_servers)
+        self.server_available = np.zeros(self.action_space.n)
         self.current_node_idx = 0
         self.topo_order = None
         
