@@ -1118,10 +1118,12 @@ class TAMPOFramework:
                 with torch.no_grad():
                     param.zero_()
 
-    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = "models/tampo_checkpoint.pth"):
+    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = None):
         """
         Main training loop with proper MAML meta-learning and checkpointing
         """
+        if checkpoint_path is None:
+            checkpoint_path = f"models/tampo_{self.encoder_type}_checkpoint.pth"
         print(f"\n{'='*60}")
         print(f"🚀 TAM-PO Meta-Training")
         print(f"{'='*60}")
