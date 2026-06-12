@@ -1,55 +1,62 @@
-# System Configuration
-system:
-  num_edge_servers: 3
-  num_users: 1
-  time_step: 0.1  # seconds
-  max_steps: 100
-  
-# Computing Resources
-computing:
-  cloud_freq: 10.0e9  # Hz
-  edge_freq: [5.0e9, 5.0e9, 5.0e9]  # Hz per server
-  local_freq: 1.0e9  # Hz
-  
-  # CPU cycles per bit
-  cloud_cycles_per_bit: 1000
-  edge_cycles_per_bit: 1000
-  local_cycles_per_bit: 1000
-
-# Energy Parameters (Watts)
-energy:
-  cloud_power_tx: 0.5
-  edge_power_tx: 0.3
-  local_power: 0.1
-  kappa: 1.0e-28  # Effective switched capacitance
-
-# Network Parameters
-network:
-  bandwidth_up: 20.0e6  # Hz
-  bandwidth_down: 20.0e6  # Hz
-  noise_power: 1.0e-13  # Watts
-  
-  # Rayleigh fading parameters
-  rayleigh_var: 1.0
-  path_loss_a: 35
-  path_loss_b: 133.6
-  antenna_gain: 0
-  shadow_fading: 8
-  noise_dBm: -174
-
-# Task Parameters
-tasks:
-  task_size_range: [1.0e6, 10.0e6]  # bits
-  task_cycles_range: [1.0e9, 10.0e9]  # cycles
-  task_type: 'dag'  # 'dag' or 'independent'
-  
-  # DAG task parameters
-  dag:
-    num_tasks_range: [10, 30]
-    dependency_prob: 0.3
+environment:
+  # System Configuration
+  system:
+    num_edge_servers: 3
+    num_users: 1
+    time_step: 0.1  # seconds
+    max_steps: 100
     
-  # Poisson arrival
-  poisson_lambda: 0.5
+  # Computing Resources
+  computing:
+    cloud_freq: 10000000000.0  # Hz
+    edge_freq: [5000000000.0, 5000000000.0, 5000000000.0]  # Hz per server
+    local_freq: 1000000000.0  # Hz
+    
+    # CPU cycles per bit
+    cloud_cycles_per_bit: 1000
+    edge_cycles_per_bit: 1000
+    local_cycles_per_bit: 1000
+
+  # Energy Parameters (Watts)
+  energy:
+    cloud_power_tx: 0.5
+    edge_power_tx: 0.3
+    local_power: 0.1
+    kappa: 1.0e-28  # Effective switched capacitance
+
+  # Network Parameters
+  network:
+    bandwidth_up: 20000000.0  # Hz
+    bandwidth_down: 20000000.0  # Hz
+    noise_power: 1.0e-13  # Watts
+    
+    # Rayleigh fading parameters
+    rayleigh_var: 1.0
+    path_loss_a: 35
+    path_loss_b: 133.6
+    antenna_gain: 0
+    shadow_fading: 8
+    noise_dBm: -174
+
+  # Task Parameters
+  tasks:
+    task_size_range: [1000000.0, 10000000.0]  # bits
+    task_cycles_range: [1000000000.0, 10000000000.0]  # cycles
+    task_type: 'dag'  # 'dag' or 'independent'
+  
+  # Reward Configuration
+  reward:
+    congestion_penalty_weight: 0.4
+    comm_penalty_weight: 0.3
+    improvement_baseline: 'local'
+    
+    # DAG task parameters
+    dag:
+      num_tasks_range: [10, 30]
+      dependency_prob: 0.3
+      
+    # Poisson arrival
+    poisson_lambda: 0.5
 
 # Training Parameters
 training:
@@ -59,10 +66,10 @@ training:
   gamma: 0.99
   
   # Meta-learning
-  meta_batch_size: 5
-  num_meta_iterations: 100
+  meta_batch_size: 8
+  num_meta_iterations: 300
   inner_lr: 0.01
-  inner_steps: 10
+  inner_steps: 3
   
   # Threshold-based communication
   hypervolume_threshold: 0.7
@@ -96,3 +103,7 @@ algorithms:
     enabled: true
     hidden_dims: [256, 256]
     num_attention_heads: 8
+    encoder_type: 'gcn'  # Options: 'lstm', 'gcn'
+    meta_learning_rate: 3.0e-4
+    num_meta_iterations: 100
+    meta_batch_size: 10

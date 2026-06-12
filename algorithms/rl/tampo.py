@@ -4,17 +4,82 @@ import torch.optim as optim
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
+from torch.func import functional_call
+from torch_geometric.data import Batch, Data
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import to_dense_batch
 from collections import deque
 import copy
 import os
 
+def _pad_graph_batch(
+    task_features_list: List[np.ndarray],
+    adjacency_list: Optional[List[np.ndarray]] = None
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pad variable-size graphs into a dense batch plus node mask."""
+    batch_size = len(task_features_list)
+    max_nodes = max(features.shape[0] for features in task_features_list)
+    feature_dim = task_features_list[0].shape[1]
+
+    task_batch = np.zeros((batch_size, max_nodes, feature_dim), dtype=np.float32)
+    adj_batch = np.zeros((batch_size, max_nodes, max_nodes), dtype=np.float32)
+    node_mask = np.zeros((batch_size, max_nodes), dtype=np.float32)
+
+    for idx, features in enumerate(task_features_list):
+        num_nodes = features.shape[0]
+        task_batch[idx, :num_nodes] = features
+        node_mask[idx, :num_nodes] = 1.0
+
+        if adjacency_list is not None and adjacency_list[idx] is not None:
+            adj = np.asarray(adjacency_list[idx], dtype=np.float32)
+        else:
+            adj = np.eye(num_nodes, dtype=np.float32)
+        adj_batch[idx, :num_nodes, :num_nodes] = adj
+
+    return task_batch, adj_batch, node_mask
+
+def _build_pyg_batch(
+    task_features_list: List[np.ndarray],
+    adjacency_list: Optional[List[np.ndarray]] = None
+) -> Batch:
+    """Build a PyG batch using edge_index, which is the standard GCN input format."""
+    data_list = []
+
+    for idx, features in enumerate(task_features_list):
+        x = torch.as_tensor(features, dtype=torch.float32)
+        num_nodes = x.size(0)
+
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        if adjacency_list is not None and adjacency_list[idx] is not None:
+            adj = torch.as_tensor(adjacency_list[idx], dtype=torch.float32)
+            edge_positions = torch.nonzero(adj > 0, as_tuple=False)
+            if edge_positions.numel() > 0:
+                edge_index = edge_positions.t().contiguous().long()
+                # Removed to_undirected to keep directed edges as per GDRL Feature.py
+
+        data_list.append(Data(x=x, edge_index=edge_index, num_nodes=num_nodes))
+
+    return Batch.from_data_list(data_list)
+
 class DAGEncoder(nn.Module):
     """
-    Enhanced encoder for DAG structure using GNN-inspired approach
+    Enhanced encoder for DAG structure using LSTM or GCN approach.
     """
     
-    def __init__(self, task_feature_dim: int, hidden_dim: int, num_layers: int = 2):
+    def __init__(
+        self,
+        task_feature_dim: int,
+        hidden_dim: int,
+        num_layers: int = 2,
+        encoder_type: str = 'lstm',
+        server_feature_dim: int = 20
+    ):
         super(DAGEncoder, self).__init__()
+        
+        self.encoder_type = encoder_type.lower()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.dropout = nn.Dropout(0.1)
         
         self.task_embedding = nn.Sequential(
             nn.Linear(task_feature_dim, hidden_dim),
@@ -22,17 +87,51 @@ class DAGEncoder(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
-        # BiLSTM for sequential processing
-        self.lstm = nn.LSTM(
-            hidden_dim, 
-            hidden_dim, 
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.1 if num_layers > 1 else 0
-        )
+        if self.encoder_type in {'lstm', 'both'}:
+            self.lstm = nn.LSTM(
+                hidden_dim, 
+                hidden_dim, 
+                num_layers=num_layers,
+                batch_first=True,
+                bidirectional=True,
+                dropout=0.1 if num_layers > 1 else 0
+            )
+        if self.encoder_type == 'gcn':
+            # GDRL Feature.py architecture mapping (Upgraded to Bi-Directional)
+            self.gnn1_fwd = GCNConv(task_feature_dim, 16)
+            self.gnn2_fwd = GCNConv(16, 1)
+            
+            self.gnn1_bwd = GCNConv(task_feature_dim, 16)
+            self.gnn2_bwd = GCNConv(16, 1)
+
+            fnn_in = server_feature_dim + 2
+            self.fnn1 = nn.Sequential(
+                nn.Linear(fnn_in, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+            )
+            self.fnn_out = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.ReLU(),
+                nn.Linear(64, hidden_dim * 2),
+                nn.ReLU()
+            )
+        elif self.encoder_type == 'both':
+            # Legacy both branch, kept for structural integrity if used elsewhere
+            self.gcn_layers = nn.ModuleList([
+                GCNConv(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2)
+                for i in range(num_layers)
+            ])
+        if self.encoder_type not in {'lstm', 'gcn', 'both'}:
+            raise ValueError(f"Unsupported encoder type: {self.encoder_type}")
         
-        # Graph attention for dependency modeling
+        if self.encoder_type == 'both':
+            self.hybrid_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 4, hidden_dim * 2),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim * 2)
+            )
+        
         self.graph_attention = nn.MultiheadAttention(
             embed_dim=hidden_dim * 2,
             num_heads=4,
@@ -41,35 +140,147 @@ class DAGEncoder(nn.Module):
         
         self.layer_norm = nn.LayerNorm(hidden_dim * 2)
         
-    def forward(self, task_features, adjacency_matrix=None):
+    def _masked_max_pool(self, x, node_mask):
+        """Max pool only across valid nodes."""
+        if node_mask is None:
+            return x.max(dim=1)[0]
+        masked_x = x.masked_fill(~node_mask.unsqueeze(-1), float('-inf'))
+        pooled = masked_x.max(dim=1)[0]
+        pooled[torch.isinf(pooled)] = 0.0
+        return pooled
+
+    def _apply_lstm(self, x, node_mask=None):
+        """BiLSTM sequence encoder over topologically ordered node features."""
+        if node_mask is None:
+            # CuDNN LSTM kernels do not support the double backward needed by MAML.
+            with torch.backends.cudnn.flags(enabled=False):
+                out, _ = self.lstm(x)
+            return out
+
+        lengths = node_mask.sum(dim=1).clamp(min=1).to(dtype=torch.int64).cpu()
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x, lengths, batch_first=True, enforce_sorted=False
+        )
+        with torch.backends.cudnn.flags(enabled=False):
+            packed_out, _ = self.lstm(packed)
+        out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_out, batch_first=True, total_length=x.size(1)
+        )
+        return out
+
+    def _apply_gcn(self, graph_batch, max_num_nodes: int):
+        """GDRL GCN forward pass (Cai et al. 2025, Feature.py)."""
+        if graph_batch is None:
+            raise ValueError("graph_batch is required for GCN-based encoders")
+
+        if self.encoder_type == 'both':
+            x = self.task_embedding(graph_batch.x)
+            edge_index = graph_batch.edge_index
+            for i, layer in enumerate(self.gcn_layers):
+                x = layer(x, edge_index)
+                if i < len(self.gcn_layers) - 1:
+                    x = self.dropout(torch.relu(x))
+            dense_x, node_mask = to_dense_batch(
+                x,
+                graph_batch.batch,
+                max_num_nodes=max_num_nodes
+            )
+            return dense_x, node_mask
+
+        # GDRL 'gcn' path
+        import torch.nn.functional as F
+        x_list = []
+        # graph_batch.batch contains graph ID per node
+        unique_graphs = torch.unique(graph_batch.batch, sorted=True)
+        for graph_id in unique_graphs:
+            mask = graph_batch.batch == graph_id
+            x_i = graph_batch.x[mask]                      # [N_i, 6]
+
+            # Extract local edge_index for this graph
+            node_offset = mask.nonzero(as_tuple=False)[0].item()
+            local_edges_fwd = graph_batch.edge_index[:, 
+                (graph_batch.edge_index[0] >= node_offset) & 
+                (graph_batch.edge_index[0] < node_offset + x_i.size(0))
+            ] - node_offset
+            
+            local_edges_bwd = local_edges_fwd[[1, 0]]
+
+            # Forward pass
+            x_fwd = self.gnn1_fwd(x_i, local_edges_fwd)
+            x_fwd = F.relu(x_fwd)
+            x_fwd = F.dropout(x_fwd, training=self.training)
+            x_fwd = self.gnn2_fwd(x_fwd, local_edges_fwd).squeeze(1)  # [N_i]
+            
+            # Backward pass
+            x_bwd = self.gnn1_bwd(x_i, local_edges_bwd)
+            x_bwd = F.relu(x_bwd)
+            x_bwd = F.dropout(x_bwd, training=self.training)
+            x_bwd = self.gnn2_bwd(x_bwd, local_edges_bwd).squeeze(1)  # [N_i]
+
+            # Mean pool both streams and combine
+            summary = torch.stack([x_fwd.mean(), x_bwd.mean()]) # [2]
+            x_list.append(summary)
+
+        # Return the aggregated graphs, node_mask is None since we bypass attention
+        return torch.stack(x_list).unsqueeze(1), None
+
+    def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None, server_features=None):
         """
         Args:
             task_features: [batch, num_tasks, feature_dim]
             adjacency_matrix: [batch, num_tasks, num_tasks] optional
+            node_mask: [batch, num_tasks] optional
+            graph_batch: PyG Batch for GCN-based encoders
+            server_features: [batch, server_feature_dim] optional, required for 'gcn'
         
         Returns:
             encoded_tasks: [batch, num_tasks, hidden_dim * 2]
             context: [batch, hidden_dim * 2]
         """
-        batch_size, num_tasks, _ = task_features.shape
-        
-        # Embed tasks
+        if self.encoder_type == 'gcn':
+            if server_features is None:
+                raise ValueError("server_features is required for GDRL GCN path")
+            graph_summary, _ = self._apply_gcn(graph_batch, task_features.size(1))  # [batch, 1, 2]
+            graph_summary = graph_summary.squeeze(1)             # [batch, 2]
+            combined = torch.cat([server_features, graph_summary], dim=-1)  # [batch, server_dim+2]
+            out = self.fnn1(combined)                            # [batch, 64]
+            context = self.fnn_out(out)                          # [batch, hidden_dim*2]
+            
+            # The decoder in GCN mode only uses context, encoded_tasks can be empty
+            # but needs to be [batch, max_num_nodes, hidden_dim*2] to not crash
+            encoded_tasks = torch.zeros(task_features.size(0), task_features.size(1), context.size(-1), device=context.device)
+            return encoded_tasks, context
+
         embedded = self.task_embedding(task_features)
-        
-        # LSTM encoding
-        lstm_out, (h_n, c_n) = self.lstm(embedded)
-        
-        # Graph attention if adjacency provided
-        if adjacency_matrix is not None:
-            attn_out, _ = self.graph_attention(
-                lstm_out, lstm_out, lstm_out
-            )
-            encoded = self.layer_norm(lstm_out + attn_out)
+        if node_mask is not None:
+            embedded = embedded * node_mask.unsqueeze(-1).float()
+
+        encoded_streams = []
+        if self.encoder_type in {'lstm', 'both'}:
+            encoded_streams.append(self._apply_lstm(embedded, node_mask))
+        if self.encoder_type == 'both':
+            gcn_out, gcn_mask = self._apply_gcn(graph_batch, task_features.size(1))
+            if node_mask is None:
+                node_mask = gcn_mask
+            encoded_streams.append(gcn_out)
+
+        if self.encoder_type == 'both':
+            out = self.hybrid_fusion(torch.cat(encoded_streams, dim=-1))
         else:
-            encoded = self.layer_norm(lstm_out)
-        
-        # Context from final hidden states
-        context = torch.cat([h_n[-2], h_n[-1]], dim=-1)
+            out = encoded_streams[0]
+
+        key_padding_mask = None
+        if node_mask is not None:
+            key_padding_mask = ~node_mask.bool()
+
+        attn_out, _ = self.graph_attention(
+            out, out, out, key_padding_mask=key_padding_mask
+        )
+        encoded = self.layer_norm(out + self.dropout(attn_out))
+        if node_mask is not None:
+            encoded = encoded * node_mask.unsqueeze(-1).float()
+
+        context = self._masked_max_pool(encoded, node_mask.bool() if node_mask is not None else None)
         
         return encoded, context
 
@@ -109,11 +320,14 @@ class PreferenceConditionedDecoder(nn.Module):
             nn.Linear(hidden_dim, num_resources)
         )
         
-    def forward(self, encoded_tasks, context, preference, num_steps):
+    def forward(self, encoded_tasks, context, preference, num_steps, node_mask=None):
         """
         Sequential decoding with preference conditioning
         """
         batch_size = encoded_tasks.size(0)
+        key_padding_mask = None
+        if node_mask is not None:
+            key_padding_mask = ~node_mask.bool()
         
         # Encode preference
         pref_encoded = self.preference_encoder(preference)
@@ -129,7 +343,7 @@ class PreferenceConditionedDecoder(nn.Module):
             query = torch.cat([h_t, pref_encoded], dim=-1).unsqueeze(1)
             
             attn_out, attn_weights = self.attention(
-                query, encoded_tasks, encoded_tasks
+                query, encoded_tasks, encoded_tasks, key_padding_mask=key_padding_mask
             )
             
             attn_context = attn_out.squeeze(1)
@@ -168,14 +382,16 @@ class MetaPolicyNetwork(nn.Module):
         server_feature_dim: int,
         num_resources: int,
         hidden_dim: int = 256,
-        num_encoder_layers: int = 2
+        num_encoder_layers: int = 2,
+        encoder_type: str = 'lstm'
     ):
         super(MetaPolicyNetwork, self).__init__()
         
         self.hidden_dim = hidden_dim
         
         self.encoder = DAGEncoder(
-            task_feature_dim, hidden_dim, num_encoder_layers
+            task_feature_dim, hidden_dim, num_encoder_layers, encoder_type=encoder_type,
+            server_feature_dim=server_feature_dim
         )
         
         self.decoder = PreferenceConditionedDecoder(
@@ -192,22 +408,31 @@ class MetaPolicyNetwork(nn.Module):
             nn.LayerNorm(hidden_dim * 2)
         )
         
-    def forward(self, task_features, server_features, preference, num_tasks, adjacency=None):
+    def forward(
+        self,
+        task_features,
+        server_features,
+        preference,
+        num_decisions: int = 1,
+        adjacency=None,
+        node_mask=None,
+        graph_batch=None
+    ):
         """
         Forward pass
         """
-        # Encode DAG
-        encoded_tasks, context = self.encoder(task_features, adjacency)
+        encoded_tasks, context = self.encoder(
+            task_features,
+            adjacency,
+            node_mask,
+            graph_batch=graph_batch,
+            server_features=server_features
+        )
         
-        # Encode server state
         server_encoded = self.server_encoder(server_features)
-        
-        # Combine contexts
         combined_context = context + server_encoded
-        
-        # Decode decisions
         action_logits = self.decoder(
-            encoded_tasks, combined_context, preference, num_tasks
+            encoded_tasks, combined_context, preference, num_decisions, node_mask=node_mask
         )
         
         return action_logits
@@ -365,31 +590,63 @@ class LowerLayerAgent:
         self.update_needed = False
         self.update_package = None
     
-    def _forward_with_params(self, params_dict, task_features, server_features, preference, num_tasks):
+    def _prepare_policy_batch(
+        self,
+        batch: List[Dict]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Batch]:
+        """Pad graph batches for dense paths and build a PyG batch for GCN paths."""
+        task_features_list = [
+            np.asarray(exp['task_features'], dtype=np.float32) for exp in batch
+        ]
+        adjacency_list = [
+            np.asarray(exp.get('adj_matrix'), dtype=np.float32)
+            if exp.get('adj_matrix') is not None else None
+            for exp in batch
+        ]
+        task_features_np, adjacency_np, node_mask_np = _pad_graph_batch(
+            task_features_list,
+            adjacency_list
+        )
+        task_features = torch.FloatTensor(task_features_np).to(self.device)
+        adjacency = torch.FloatTensor(adjacency_np).to(self.device)
+        node_mask = torch.BoolTensor(node_mask_np.astype(bool)).to(self.device)
+        graph_batch = _build_pyg_batch(task_features_list, adjacency_list).to(self.device)
+
+        server_features = torch.FloatTensor(
+            np.array([exp['server_features'] for exp in batch], dtype=np.float32)
+        ).to(self.device)
+
+        return task_features, server_features, adjacency, node_mask, graph_batch
+
+    def _forward_with_params(
+        self,
+        params_dict,
+        task_features,
+        server_features,
+        preference,
+        num_decisions: int = 1,
+        adjacency=None,
+        node_mask=None,
+        graph_batch=None
+    ):
         """
         Forward pass using specific parameters (for functional gradient computation)
-        This is the KEY to making MAML work - we use functional programming style
+        This keeps the full inner-loop update chain differentiable for MAML.
         """
-        # This is a simplified version - you'd need to implement proper functional forward
-        # For now, we'll use a workaround with temporary parameter assignment
-        
-        # Save original parameters
-        original_params = {}
-        for name, param in self.meta_policy.named_parameters():
-            original_params[name] = param.data.clone()
-        
-        # Temporarily set adapted parameters
-        for name, param in self.meta_policy.named_parameters():
-            if name in params_dict:
-                param.data = params_dict[name]
-        
-        # Forward pass
-        output = self.meta_policy(task_features, server_features, preference, num_tasks)
-        
-        # Restore original parameters
-        for name, param in self.meta_policy.named_parameters():
-            param.data = original_params[name]
-        
+        buffer_dict = dict(self.meta_policy.named_buffers())
+
+        output = functional_call(
+            self.meta_policy,
+            (params_dict, buffer_dict),
+            (task_features, server_features, preference),
+            {
+                'num_decisions': num_decisions,
+                'adjacency': adjacency,
+                'node_mask': node_mask,
+                'graph_batch': graph_batch
+            }
+        )
+
         return output
         
     def inner_loop_update(self, experiences: List[Dict], num_steps: int, create_graph: bool = False):
@@ -460,24 +717,22 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
-        task_features_list = [exp['task_features'] for exp in batch]
-        task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
-        if len(task_features.shape) == 4:
-            task_features = task_features.squeeze(1)
-        
-        server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
-        if len(server_features.shape) == 3:
-            server_features = server_features.squeeze(1)
+        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+            
         # Forward pass with adapted parameters
-        num_tasks = task_features.size(1)
         action_logits = self._forward_with_params(
-            params_dict, task_features, server_features, preferences, num_tasks
+            params_dict,
+            task_features,
+            server_features,
+            preferences,
+            num_decisions=1,
+            adjacency=adjacency,
+            node_mask=node_mask,
+            graph_batch=graph_batch
         )
         
         # Policy loss
@@ -509,23 +764,22 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        
-        task_features_list = [exp['task_features'] for exp in batch]
-        task_features = torch.FloatTensor(np.array(task_features_list)).to(self.device)
-        if len(task_features.shape) == 4:
-            task_features = task_features.squeeze(1)
-        
-        server_features = torch.FloatTensor(np.array([exp['server_features'] for exp in batch])).to(self.device)
-        if len(server_features.shape) == 3:
-            server_features = server_features.squeeze(1)
+        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
             
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-        
+            
         # Forward pass
-        num_tasks = task_features.size(1)
-        action_logits = self.meta_policy(task_features, server_features, preferences, num_tasks)
+        action_logits = self.meta_policy(
+            task_features,
+            server_features,
+            preferences,
+            num_decisions=1,
+            adjacency=adjacency,
+            node_mask=node_mask,
+            graph_batch=graph_batch
+        )
         
         # Policy loss
         logits = action_logits[:, 0, :]
@@ -650,50 +904,56 @@ class HigherLayerMetaLearner:
         """
         meta_loss = 0.0
         valid_tasks = 0
+        encoder_type = getattr(self.meta_policy.encoder, 'encoder_type', 'lstm')
         
         # Zero gradients before meta-update
         self.meta_optimizer.zero_grad()
-        
-        for task_data in task_batch:
-            if len(task_data['test_experiences']) == 0:
-                continue
-            
-            # Create temporary agent sharing meta-policy reference
-            temp_agent = LowerLayerAgent(
-                agent_id=-1,
-                meta_policy=self.meta_policy,
-                value_network=self.value_network,
-                config=self.config,
-                device=self.device
-            )
-            
-            # Inner loop adaptation with gradient graph creation
-            adapted_params = None
-            if len(task_data['train_experiences']) > 0:
-                adapted_params = temp_agent.inner_loop_update(
-                    task_data['train_experiences'],
-                    num_steps=self.config.get('inner_steps', 3),
-                    create_graph=True  # CRITICAL: Enables second-order gradients
+
+        # CuDNN-backed RNN kernels do not support the second-order gradients
+        # required by MAML. Guard the whole meta-update so every LSTM forward
+        # participating in this graph uses the autograd-compatible backend.
+        cudnn_enabled = encoder_type not in {'lstm', 'both'}
+        with torch.backends.cudnn.flags(enabled=cudnn_enabled):
+            for task_data in task_batch:
+                if len(task_data['test_experiences']) == 0:
+                    continue
+                
+                # Create temporary agent sharing meta-policy reference
+                temp_agent = LowerLayerAgent(
+                    agent_id=-1,
+                    meta_policy=self.meta_policy,
+                    value_network=self.value_network,
+                    config=self.config,
+                    device=self.device
                 )
+                
+                # Inner loop adaptation with gradient graph creation
+                adapted_params = None
+                if len(task_data['train_experiences']) > 0:
+                    adapted_params = temp_agent.inner_loop_update(
+                        task_data['train_experiences'],
+                        num_steps=self.config.get('inner_steps', 3),
+                        create_graph=True  # CRITICAL: Enables second-order gradients
+                    )
+                
+                # Compute test loss with adapted parameters
+                if len(task_data['test_experiences']) > 0 and adapted_params is not None:
+                    test_loss = temp_agent._compute_loss_with_params(
+                        adapted_params,
+                        task_data['test_experiences']
+                    )
+                    meta_loss = meta_loss + test_loss
+                    valid_tasks += 1
             
-            # Compute test loss with adapted parameters
-            if len(task_data['test_experiences']) > 0 and adapted_params is not None:
-                test_loss = temp_agent._compute_loss_with_params(
-                    adapted_params,
-                    task_data['test_experiences']
-                )
-                meta_loss = meta_loss + test_loss
-                valid_tasks += 1
-        
-        if valid_tasks == 0:
-            print("WARNING: No valid tasks for meta-update!")
-            return 0.0
-        
-        # Average meta-loss across tasks
-        meta_loss = meta_loss / valid_tasks
-        
-        # Backpropagate through entire computation graph
-        meta_loss.backward()
+            if valid_tasks == 0:
+                print("WARNING: No valid tasks for meta-update!")
+                return 0.0
+            
+            # Average meta-loss across tasks
+            meta_loss = meta_loss / valid_tasks
+            
+            # Backpropagate through entire computation graph
+            meta_loss.backward()
         
         # Check if gradients are flowing properly
         print("\n=== Meta-Gradient Check ===")
@@ -796,14 +1056,17 @@ class TAMPOFramework:
         task_feature_dim = 6
         server_feature_dim = 20
         num_resources = env.action_space.n
-        hidden_dim = config.get('hidden_dim', 128)  # Smaller network
+        hidden_dim = config.get('hidden_dim', config.get('hidden_dims', [128])[0])
+        encoder_type = config.get('encoder_type', 'lstm')
+        self.encoder_type = encoder_type
         
         # Initialize networks
         meta_policy = MetaPolicyNetwork(
             task_feature_dim=task_feature_dim,
             server_feature_dim=server_feature_dim,
             num_resources=num_resources,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            encoder_type=encoder_type
         )
         
         value_network = MultiObjectiveValueNetwork(
@@ -811,12 +1074,8 @@ class TAMPOFramework:
             hidden_dim=hidden_dim
         )
         
-        # AGGRESSIVE initialization - strongly bias toward offloading
+        # Explicit decoder initialization hook.
         self._initialize_policy_bias(meta_policy, num_resources)
-        
-        # Create meta-learner with higher learning rate
-        config['meta_learning_rate'] = 3e-3  # 10x higher
-        config['inner_lr'] = 0.1  # 10x higher
         
         self.meta_learner = HigherLayerMetaLearner(
             meta_policy=meta_policy,
@@ -844,32 +1103,27 @@ class TAMPOFramework:
             self.load(model_path)
             print(f"✓ Resuming from checkpoint: {model_path}")
         else:
-            print("✓ Initialized new TAM-PO model with STRONG offloading bias")
+            print("✓ Initialized new TAM-PO model with neutral decoder initialization")
     
     def _initialize_policy_bias(self, policy: MetaPolicyNetwork, num_resources: int):
         """
-        EXTREME initialization bias toward offloading
+        Keep decoder initialization explicit but neutral so the learned policy
+        reflects the data and preference conditioning instead of hand-crafted
+        action priors.
         """
         for name, param in policy.decoder.decision_head.named_parameters():
             if 'weight' in name and param.dim() == 2:
                 nn.init.xavier_uniform_(param)
-                with torch.no_grad():
-                    # Make local EXTREMELY unlikely
-                    param[:, 0] *= 0.01
-                    # Make cloud/edge EXTREMELY likely
-                    for i in range(1, num_resources):
-                        param[:, i] *= 5.0
             elif 'bias' in name:
                 with torch.no_grad():
-                    param[0] = -10.0  # Massive penalty for local
-                    param[1] = 5.0    # Huge bonus for cloud
-                    for i in range(2, len(param)):
-                        param[i] = 4.0  # Big bonus for edge
+                    param.zero_()
 
-    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = "models/tampo_checkpoint.pth"):
+    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = None):
         """
         Main training loop with proper MAML meta-learning and checkpointing
         """
+        if checkpoint_path is None:
+            checkpoint_path = f"models/tampo_{self.encoder_type}_checkpoint.pth"
         print(f"\n{'='*60}")
         print(f"🚀 TAM-PO Meta-Training")
         print(f"{'='*60}")
@@ -879,71 +1133,77 @@ class TAMPOFramework:
         print(f"  Inner LR: {self.config.get('inner_lr', 0.01)}")
         print(f"  Meta LR: {self.config.get('meta_learning_rate', 1e-4)}")
         print(f"{'='*60}\n")
+
+        cudnn_enabled = not (self.encoder_type in {'lstm', 'both'} and self.device.type == 'cuda')
+        if not cudnn_enabled:
+            print("  CuDNN disabled for TAMPO LSTM-style meta-training to support second-order gradients.")
         
-        # Create checkpoint directory
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        
-        start_iter = self.training_history['iterations']
-        
-        for iteration in range(num_iterations):
-            current_iter = start_iter + iteration
+        with torch.backends.cudnn.flags(enabled=cudnn_enabled):
+            # Create checkpoint directory
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
             
-            # Sample tasks
-            if hasattr(self.env, 'sample_tasks'):
-                task_ids = self.env.sample_tasks(meta_batch_size)
-            else:
-                task_ids = list(range(min(meta_batch_size, 10)))
+            start_iter = self.training_history['iterations']
             
-            task_batch = []
-            
-            # Collect experiences (silent mode)
-            for task_id in task_ids:
-                if hasattr(self.env, 'set_task'):
-                    self.env.set_task(task_id)
+            for iteration in range(num_iterations):
+                current_iter = start_iter + iteration
                 
-                train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
+                # Sample tasks
+                if hasattr(self.env, 'sample_tasks'):
+                    task_ids = self.env.sample_tasks(meta_batch_size)
+                else:
+                    task_ids = list(range(min(meta_batch_size, 10)))
                 
-                task_batch.append({
-                    'task_id': task_id,
-                    'train_experiences': train_exp,
-                    'test_experiences': test_exp
-                })
+                task_batch = []
+                
+                # Collect experiences (silent mode)
+                for task_id in task_ids:
+                    if hasattr(self.env, 'set_task'):
+                        self.env.set_task(task_id)
+                    
+                    train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
+                    
+                    task_batch.append({
+                        'task_id': task_id,
+                        'train_experiences': train_exp,
+                        'test_experiences': test_exp
+                    })
+                
+                # Meta-update
+                import sys
+                from io import StringIO
+                
+                old_stdout = sys.stdout
+                sys.stdout = StringIO()
+                
+                meta_loss = self.meta_learner.meta_update(task_batch)
+                
+                sys.stdout = old_stdout
+                
+                # Store loss
+                self.training_history['losses'].append(meta_loss)
+                self.training_history['iterations'] = current_iter + 1
+                
+                # Update best loss
+                if meta_loss < self.training_history['best_loss']:
+                    self.training_history['best_loss'] = meta_loss
+                    best_path = checkpoint_path.replace('.pth', '_best.pth')
+                    self._save_checkpoint(best_path)
+                
+                # Progress reporting every 5 iterations
+                if (iteration + 1) % 5 == 0 or iteration == 0:
+                    avg_loss_10 = np.mean(self.training_history['losses'][-10:])
+                    print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
+                          f"Loss: {meta_loss:.4f} | "
+                          f"Avg(10): {avg_loss_10:.4f} | "
+                          f"Best: {self.training_history['best_loss']:.4f}")
+                
+                # Save checkpoint every 10 iterations
+                if (iteration + 1) % 10 == 0:
+                    self._save_checkpoint(checkpoint_path)
             
-            # Meta-update
-            import sys
-            from io import StringIO
-            
-            old_stdout = sys.stdout
-            sys.stdout = StringIO()
-            
-            meta_loss = self.meta_learner.meta_update(task_batch)
-            
-            sys.stdout = old_stdout
-            
-            # Store loss
-            self.training_history['losses'].append(meta_loss)
-            self.training_history['iterations'] = current_iter + 1
-            
-            # Update best loss
-            if meta_loss < self.training_history['best_loss']:
-                self.training_history['best_loss'] = meta_loss
-                best_path = checkpoint_path.replace('.pth', '_best.pth')
-                self._save_checkpoint(best_path)
-            
-            # Progress reporting every 5 iterations
-            if (iteration + 1) % 5 == 0 or iteration == 0:
-                avg_loss_10 = np.mean(self.training_history['losses'][-10:])
-                print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
-                      f"Loss: {meta_loss:.4f} | "
-                      f"Avg(10): {avg_loss_10:.4f} | "
-                      f"Best: {self.training_history['best_loss']:.4f}")
-            
-            # Save checkpoint every 10 iterations
-            if (iteration + 1) % 10 == 0:
-                self._save_checkpoint(checkpoint_path)
-        
-        # Final save
-        self._save_checkpoint(checkpoint_path)
+            # Final save
+            self._save_checkpoint(checkpoint_path)
+
         print(f"\n✓ Training complete!")
         print(f"  Total iterations: {self.training_history['iterations']}")
         print(f"  Final loss: {meta_loss:.4f}")
@@ -962,24 +1222,30 @@ class TAMPOFramework:
     
     def _collect_task_experiences(self, task_id: int, num_episodes: int = 10):
         """Collect MORE experiences for better learning"""
-        train_experiences = []
-        test_experiences = []
+        all_experiences = []
         
         for ep in range(num_episodes):  # Increased from 5 to 10
             preference = self._sample_preference()
             
             state = self.env.reset(preference_vector=preference)
             done = False
-            episode_exp = []
             
             step_count = 0
-            max_steps = 50  # More steps per episode
+            num_nodes = len(self.env.current_task['tasks']) if self.env._is_dag_task() else 50
+            max_steps = num_nodes
             
             while not done and step_count < max_steps:
                 task_features = self._extract_task_features(state)
                 server_features = self._extract_server_features(state)
+                adj_matrix = self._extract_adjacency_matrix()
                 
-                action = self._select_action(task_features, server_features, preference)
+                action = self._select_action(
+                    task_features,
+                    server_features,
+                    preference,
+                    adj_matrix,
+                    deterministic=False
+                )
                 
                 next_state, reward, done, info = self.env.step(action)
                 
@@ -987,6 +1253,7 @@ class TAMPOFramework:
                     'state': state,
                     'task_features': task_features,
                     'server_features': server_features,
+                    'adj_matrix': adj_matrix,
                     'action': action,
                     'reward': reward,  # Use raw reward (already very strong signal)
                     'preference': preference,
@@ -994,17 +1261,20 @@ class TAMPOFramework:
                     'next_state': next_state,
                     'done': done
                 }
-                episode_exp.append(exp)
+                all_experiences.append(exp)
                 
                 state = next_state
                 step_count += 1
-            
-            # Split train/test 80/20
-            if len(episode_exp) > 0:
-                split = max(1, int(len(episode_exp) * 0.8))
-                train_experiences.extend(episode_exp[:split])
-                test_experiences.extend(episode_exp[split:])
-        
+
+        if len(all_experiences) <= 1:
+            return all_experiences, all_experiences
+
+        split = max(1, int(len(all_experiences) * 0.8))
+        if split >= len(all_experiences):
+            split = len(all_experiences) - 1
+
+        train_experiences = all_experiences[:split]
+        test_experiences = all_experiences[split:]
         return train_experiences, test_experiences
     
     def _sample_preference(self) -> np.ndarray:
@@ -1013,36 +1283,101 @@ class TAMPOFramework:
         w_energy = 1.0 - w_delay
         return np.array([w_delay, w_energy])
     
-    def _extract_task_features(self, state: np.ndarray) -> np.ndarray:
-        """Extract task features"""
-        task_feat = state[:6].reshape(1, 1, -1)
-        return task_feat
+    def _extract_task_features(self, state: Optional[np.ndarray] = None) -> np.ndarray:
+        """Extract graph node features for the active DAG."""
+        if hasattr(self.env, 'get_task_feature_matrix'):
+            features = self.env.get_task_feature_matrix()
+            if features is not None:
+                return np.asarray(features, dtype=np.float32)
+
+        if state is None:
+            return np.zeros((1, 6), dtype=np.float32)
+
+        return np.asarray(state[:6], dtype=np.float32).reshape(1, -1)
     
-    def _extract_server_features(self, state: np.ndarray) -> np.ndarray:
-        """Extract server features"""
-        server_feat = state[6:26].reshape(1, -1)
-        return server_feat
+    def _extract_server_features(self, state: Optional[np.ndarray] = None) -> np.ndarray:
+        """Extract structured server features."""
+        if hasattr(self.env, 'get_server_features'):
+            features = self.env.get_server_features()
+            if features is not None:
+                return np.asarray(features, dtype=np.float32)
+
+        if state is None:
+            return np.zeros(20, dtype=np.float32)
+
+        server_slice = state[6:26]
+        if len(server_slice) < 20:
+            server_slice = np.pad(server_slice, (0, 20 - len(server_slice)))
+        return np.asarray(server_slice[:20], dtype=np.float32)
+
+    def _extract_adjacency_matrix(self) -> np.ndarray:
+        """Return the active adjacency matrix or a single-node identity fallback."""
+        if hasattr(self.env, 'get_adjacency_matrix'):
+            adj_matrix = self.env.get_adjacency_matrix()
+            if adj_matrix is not None:
+                return np.asarray(adj_matrix, dtype=np.float32)
+
+        node_count = self._extract_task_features().shape[0]
+        return np.eye(node_count, dtype=np.float32)
+
+    def select_action(self, state: np.ndarray, preference: np.ndarray, deterministic: bool = True) -> int:
+        """Public deterministic action helper used by evaluation."""
+        task_features = self._extract_task_features(state)
+        server_features = self._extract_server_features(state)
+        adj_matrix = self._extract_adjacency_matrix()
+        return self._select_action(
+            task_features,
+            server_features,
+            preference,
+            adj_matrix=adj_matrix,
+            deterministic=deterministic
+        )
     
-    def _select_action(self, task_features, server_features, preference):
-        """Select action - minimal exploration needed with strong init"""
+    def _select_action(
+        self,
+        task_features,
+        server_features,
+        preference,
+        adj_matrix=None,
+        deterministic: bool = False
+    ):
+        """Select a graph-conditioned offloading action."""
         with torch.no_grad():
-            task_tensor = torch.FloatTensor(task_features).to(self.device)
-            server_tensor = torch.FloatTensor(server_features).to(self.device)
+            task_tensor = torch.FloatTensor(task_features).unsqueeze(0).to(self.device)
+            server_tensor = torch.FloatTensor(server_features).unsqueeze(0).to(self.device)
             pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
+            node_mask = torch.ones((1, task_features.shape[0]), dtype=torch.bool, device=self.device)
+            
+            if adj_matrix is None:
+                adj_matrix = np.eye(task_features.shape[0], dtype=np.float32)
+            adj_tensor = torch.FloatTensor(adj_matrix).unsqueeze(0).to(self.device)
+            graph_batch = _build_pyg_batch(
+                [np.asarray(task_features, dtype=np.float32)],
+                [np.asarray(adj_matrix, dtype=np.float32)]
+            ).to(self.device)
             
             logits = self.agents[0].meta_policy(
-                task_tensor, server_tensor, pref_tensor, num_tasks=1
+                task_tensor,
+                server_tensor,
+                pref_tensor,
+                num_decisions=1,
+                adjacency=adj_tensor,
+                node_mask=node_mask,
+                graph_batch=graph_batch
             )
             
             probs = torch.softmax(logits[:, 0, :], dim=-1)
             
-            # Very minimal exploration (5%)
-            if np.random.rand() < 0.05:
-                # Even in exploration, never choose local
-                weights = np.array([0.0, 0.5, 0.25, 0.25])  # No local!
-                action = np.random.choice(len(weights), p=weights/weights.sum())
-            else:
+            if deterministic or np.random.rand() >= 0.05:
                 action = torch.argmax(probs, dim=-1).item()
+            else:
+                exploration_weights = np.zeros(self.env.action_space.n, dtype=np.float32)
+                if self.env.action_space.n > 1:
+                    exploration_weights[1:] = 1.0
+                action = int(np.random.choice(
+                    self.env.action_space.n,
+                    p=exploration_weights / exploration_weights.sum()
+                ))
         
         return action
     
@@ -1071,20 +1406,18 @@ class TAMPOFramework:
                 episode_energy = 0
                 
                 step_count = 0
-                max_steps = 50
+                num_nodes = len(self.env.current_task['tasks']) if self.env._is_dag_task() else 50
+                max_steps = num_nodes
                 
                 while not done and step_count < max_steps:
-                    task_features = self._extract_task_features(state)
-                    server_features = self._extract_server_features(state)
-                    
-                    action = self._select_action(task_features, server_features, pref)
+                    action = self.select_action(state, pref, deterministic=True)
                     
                     state, reward, done, info = self.env.step(action)
                     
-                    episode_delay += info.get('delay', 0)
-                    episode_energy += info.get('energy', 0)
-                    
                     step_count += 1
+                
+                episode_delay = info.get('makespan', self.env.total_delay)
+                episode_energy = info.get('total_energy', self.env.total_energy)
                 
                 delays.append(episode_delay)
                 energies.append(episode_energy)
