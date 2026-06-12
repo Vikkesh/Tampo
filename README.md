@@ -109,9 +109,9 @@ Edit `configs/default_config.yaml` to set the algorithm and all hyperparameters 
 algorithms:
   tampo:
     encoder_type: 'gcn'   # Change to 'lstm' for the LSTM variant
-    hidden_dim: 128
+    hidden_dims: [128, 128]
     num_meta_iterations: 100
-    num_tasks_per_iter: 10
+    meta_batch_size: 10
 ```
 
 Then run without any prompts:
@@ -209,7 +209,7 @@ algorithms:
     num_attention_heads: 8         # Recommended: 8 (used only when encoder_type is 'lstm')
     encoder_type: 'gcn'            # Options: 'gcn' (Bi-Directional GCN) or 'lstm' (BiLSTM)
     num_meta_iterations: 100       # Recommended: 100+ for actual training, 1 for smoke tests
-    num_tasks_per_iter: 10         # Recommended: 10-20 to ensure stable meta-gradients
+    meta_batch_size: 10            # Recommended: 10-20 to ensure stable meta-gradients
 ```
 
 ### 2. How to Compare Multiple Algorithms
