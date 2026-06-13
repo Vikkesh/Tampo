@@ -103,7 +103,12 @@ algorithms:
     enabled: true
     hidden_dims: [256, 256]
     num_attention_heads: 8
-    encoder_type: 'gcn'  # Options: 'lstm', 'gcn'
+    encoder_type: 'gcn'  # Options: 'lstm', 'gcn', 'gat'
     meta_learning_rate: 3.0e-4
     num_meta_iterations: 100
     meta_batch_size: 10
+
+    # GAT encoder parameters (used only when encoder_type: 'gat')
+    num_gat_heads: 4        # attention heads for GATv2Conv layer 1
+    gat_hidden_dim: 16      # intermediate dim = num_gat_heads * (gat_hidden_dim // num_gat_heads)
+    gat_add_self_loops: true  # match GCNConv default for fair comparison

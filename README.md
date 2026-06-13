@@ -71,7 +71,8 @@ tampo/
 
 | Algorithm | Type | Encoder | Observation Wrapper |
 |---|---|---|---|
-| TAMPO-GCN | TAMPO meta-RL | Bi-GCNConv(6,16)→(16,1)→FNN | None (raw graph) |
+| TAMPO-GCN | TAMPO meta-RL | Bi-GCNConv(6→16)→(16→1)→FNN | None (raw graph) |
+| TAMPO-GAT | TAMPO meta-RL | Bi-GATv2Conv(6→16,heads=4)→(16→1)→FNN | None (raw graph) |
 | TAMPO-LSTM | TAMPO meta-RL | BiLSTM → Attention | None (raw graph) |
 
 *More baselines will be added to this table as they are implemented.*
@@ -207,9 +208,14 @@ algorithms:
     enabled: true                  # Set to true to run this algorithm
     hidden_dims: [256, 256]        # Recommended: [256, 256] for complex DAGs, [128, 128] for simpler ones
     num_attention_heads: 8         # Recommended: 8 (used only when encoder_type is 'lstm')
-    encoder_type: 'gcn'            # Options: 'gcn' (Bi-Directional GCN) or 'lstm' (BiLSTM)
+    encoder_type: 'gcn'            # Options: 'gcn' (Bi-GCN), 'gat' (Bi-GATv2), or 'lstm' (BiLSTM)
     num_meta_iterations: 100       # Recommended: 100+ for actual training, 1 for smoke tests
     meta_batch_size: 10            # Recommended: 10-20 to ensure stable meta-gradients
+
+    # GAT-specific parameters (only active when encoder_type: 'gat')
+    num_gat_heads: 4               # Attention heads for GATv2Conv layer 1 (intermediate dim = gat_hidden_dim)
+    gat_hidden_dim: 16             # Must be divisible by num_gat_heads; keeps intermediate dim equal to GCN
+    gat_add_self_loops: true       # Match GCNConv default for fair comparison
 ```
 
 ### 2. How to Compare Multiple Algorithms

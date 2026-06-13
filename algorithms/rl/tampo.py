@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple, Optional
 from torch.distributions import Categorical
 from torch.func import functional_call
 from torch_geometric.data import Batch, Data
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GATv2Conv
 from torch_geometric.utils import to_dense_batch
 from collections import deque
 import copy
@@ -72,25 +72,28 @@ class DAGEncoder(nn.Module):
         hidden_dim: int,
         num_layers: int = 2,
         encoder_type: str = 'lstm',
-        server_feature_dim: int = 20
+        server_feature_dim: int = 20,
+        num_gat_heads: int = 4,
+        gat_hidden_dim: int = 16,
+        gat_add_self_loops: bool = True
     ):
         super(DAGEncoder, self).__init__()
-        
+
         self.encoder_type = encoder_type.lower()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.dropout = nn.Dropout(0.1)
-        
+
         self.task_embedding = nn.Sequential(
             nn.Linear(task_feature_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim)
         )
-        
+
         if self.encoder_type in {'lstm', 'both'}:
             self.lstm = nn.LSTM(
-                hidden_dim, 
-                hidden_dim, 
+                hidden_dim,
+                hidden_dim,
                 num_layers=num_layers,
                 batch_first=True,
                 bidirectional=True,
@@ -100,9 +103,43 @@ class DAGEncoder(nn.Module):
             # GDRL Feature.py architecture mapping (Upgraded to Bi-Directional)
             self.gnn1_fwd = GCNConv(task_feature_dim, 16)
             self.gnn2_fwd = GCNConv(16, 1)
-            
+
             self.gnn1_bwd = GCNConv(task_feature_dim, 16)
             self.gnn2_bwd = GCNConv(16, 1)
+
+            fnn_in = server_feature_dim + 2
+            self.fnn1 = nn.Sequential(
+                nn.Linear(fnn_in, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+            )
+            self.fnn_out = nn.Sequential(
+                nn.Linear(64, 64),
+                nn.ReLU(),
+                nn.Linear(64, hidden_dim * 2),
+                nn.ReLU()
+            )
+        elif self.encoder_type == 'gat':
+            # Bi-GATv2 architecture — drop-in for Bi-GCN (GAPO, Zhang et al. 2025)
+            # Layer 1: concat=True  → out = hidden_per_head * heads = gat_hidden_dim
+            # Layer 2: heads=1, concat=False → out = 1 → squeeze → mean pool → scalar
+            hidden_per_head = gat_hidden_dim // num_gat_heads
+            self.gat1_fwd = GATv2Conv(
+                task_feature_dim, hidden_per_head, heads=num_gat_heads,
+                concat=True, dropout=0.1, add_self_loops=gat_add_self_loops
+            )
+            self.gat2_fwd = GATv2Conv(
+                gat_hidden_dim, 1, heads=1,
+                concat=False, dropout=0.1, add_self_loops=gat_add_self_loops
+            )
+            self.gat1_bwd = GATv2Conv(
+                task_feature_dim, hidden_per_head, heads=num_gat_heads,
+                concat=True, dropout=0.1, add_self_loops=gat_add_self_loops
+            )
+            self.gat2_bwd = GATv2Conv(
+                gat_hidden_dim, 1, heads=1,
+                concat=False, dropout=0.1, add_self_loops=gat_add_self_loops
+            )
 
             fnn_in = server_feature_dim + 2
             self.fnn1 = nn.Sequential(
@@ -122,7 +159,7 @@ class DAGEncoder(nn.Module):
                 GCNConv(hidden_dim if i == 0 else hidden_dim * 2, hidden_dim * 2)
                 for i in range(num_layers)
             ])
-        if self.encoder_type not in {'lstm', 'gcn', 'both'}:
+        if self.encoder_type not in {'lstm', 'gcn', 'gat', 'both'}:
             raise ValueError(f"Unsupported encoder type: {self.encoder_type}")
         
         if self.encoder_type == 'both':
@@ -224,6 +261,44 @@ class DAGEncoder(nn.Module):
         # Return the aggregated graphs, node_mask is None since we bypass attention
         return torch.stack(x_list).unsqueeze(1), None
 
+    def _apply_gat(self, graph_batch, max_num_nodes: int):
+        """Bi-GATv2 forward pass — drop-in replacement for Bi-GCN (GAPO, Zhang et al. 2025)."""
+        if graph_batch is None:
+            raise ValueError("graph_batch is required for GAT-based encoders")
+
+        import torch.nn.functional as F
+        x_list = []
+        unique_graphs = torch.unique(graph_batch.batch, sorted=True)
+        for graph_id in unique_graphs:
+            mask = graph_batch.batch == graph_id
+            x_i = graph_batch.x[mask]                      # [N_i, task_feature_dim]
+
+            node_offset = mask.nonzero(as_tuple=False)[0].item()
+            local_edges_fwd = graph_batch.edge_index[:,
+                (graph_batch.edge_index[0] >= node_offset) &
+                (graph_batch.edge_index[0] < node_offset + x_i.size(0))
+            ] - node_offset
+
+            local_edges_bwd = local_edges_fwd[[1, 0]]
+
+            # Forward stream (DAG direction: parent → child)
+            x_fwd = self.gat1_fwd(x_i, local_edges_fwd)   # [N_i, gat_hidden_dim]
+            x_fwd = F.relu(x_fwd)
+            x_fwd = F.dropout(x_fwd, training=self.training)
+            x_fwd = self.gat2_fwd(x_fwd, local_edges_fwd).squeeze(1)  # [N_i]
+
+            # Backward stream (reversed DAG: child → parent)
+            x_bwd = self.gat1_bwd(x_i, local_edges_bwd)   # [N_i, gat_hidden_dim]
+            x_bwd = F.relu(x_bwd)
+            x_bwd = F.dropout(x_bwd, training=self.training)
+            x_bwd = self.gat2_bwd(x_bwd, local_edges_bwd).squeeze(1)  # [N_i]
+
+            # Mean pool both streams → [2] graph summary
+            summary = torch.stack([x_fwd.mean(), x_bwd.mean()])
+            x_list.append(summary)
+
+        return torch.stack(x_list).unsqueeze(1), None
+
     def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None, server_features=None):
         """
         Args:
@@ -237,17 +312,19 @@ class DAGEncoder(nn.Module):
             encoded_tasks: [batch, num_tasks, hidden_dim * 2]
             context: [batch, hidden_dim * 2]
         """
-        if self.encoder_type == 'gcn':
+        if self.encoder_type in {'gcn', 'gat'}:
             if server_features is None:
-                raise ValueError("server_features is required for GDRL GCN path")
-            graph_summary, _ = self._apply_gcn(graph_batch, task_features.size(1))  # [batch, 1, 2]
+                raise ValueError("server_features is required for GCN/GAT path")
+            if self.encoder_type == 'gcn':
+                graph_summary, _ = self._apply_gcn(graph_batch, task_features.size(1))
+            else:
+                graph_summary, _ = self._apply_gat(graph_batch, task_features.size(1))
             graph_summary = graph_summary.squeeze(1)             # [batch, 2]
             combined = torch.cat([server_features, graph_summary], dim=-1)  # [batch, server_dim+2]
             out = self.fnn1(combined)                            # [batch, 64]
             context = self.fnn_out(out)                          # [batch, hidden_dim*2]
-            
-            # The decoder in GCN mode only uses context, encoded_tasks can be empty
-            # but needs to be [batch, max_num_nodes, hidden_dim*2] to not crash
+
+            # Decoder only uses context; encoded_tasks must be shape-compatible
             encoded_tasks = torch.zeros(task_features.size(0), task_features.size(1), context.size(-1), device=context.device)
             return encoded_tasks, context
 
@@ -383,15 +460,21 @@ class MetaPolicyNetwork(nn.Module):
         num_resources: int,
         hidden_dim: int = 256,
         num_encoder_layers: int = 2,
-        encoder_type: str = 'lstm'
+        encoder_type: str = 'lstm',
+        num_gat_heads: int = 4,
+        gat_hidden_dim: int = 16,
+        gat_add_self_loops: bool = True
     ):
         super(MetaPolicyNetwork, self).__init__()
-        
+
         self.hidden_dim = hidden_dim
-        
+
         self.encoder = DAGEncoder(
             task_feature_dim, hidden_dim, num_encoder_layers, encoder_type=encoder_type,
-            server_feature_dim=server_feature_dim
+            server_feature_dim=server_feature_dim,
+            num_gat_heads=num_gat_heads,
+            gat_hidden_dim=gat_hidden_dim,
+            gat_add_self_loops=gat_add_self_loops
         )
         
         self.decoder = PreferenceConditionedDecoder(
@@ -1059,14 +1142,22 @@ class TAMPOFramework:
         hidden_dim = config.get('hidden_dim', config.get('hidden_dims', [128])[0])
         encoder_type = config.get('encoder_type', 'lstm')
         self.encoder_type = encoder_type
-        
+
+        # GAT-specific config (ignored for non-GAT encoders)
+        num_gat_heads = config.get('num_gat_heads', 4)
+        gat_hidden_dim = config.get('gat_hidden_dim', 16)
+        gat_add_self_loops = config.get('gat_add_self_loops', True)
+
         # Initialize networks
         meta_policy = MetaPolicyNetwork(
             task_feature_dim=task_feature_dim,
             server_feature_dim=server_feature_dim,
             num_resources=num_resources,
             hidden_dim=hidden_dim,
-            encoder_type=encoder_type
+            encoder_type=encoder_type,
+            num_gat_heads=num_gat_heads,
+            gat_hidden_dim=gat_hidden_dim,
+            gat_add_self_loops=gat_add_self_loops
         )
         
         value_network = MultiObjectiveValueNetwork(

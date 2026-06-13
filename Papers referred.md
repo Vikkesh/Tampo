@@ -15,3 +15,13 @@ the BiLSTM path.  Directed edges are preserved as per the reference implementati
 ---
 
 
+## GAPO GATv2 Encoder
+
+Y. Zhang, X. Wang, Y. Wang, W. Liu, and H. Wang,
+"GAPO: A Graph Attention-Based Reinforcement Learning Algorithm for Congestion-Aware Task Offloading in Multi-Hop Vehicular Edge Computing,"
+Electronics (MDPI), vol. 14, no. 16, Art. no. 3238, 2025.
+https://doi.org/10.3390/electronics14163238
+
+*Used for:* Adapting the DAG encoder from a two-layer GCN architecture to a two-layer Graph Attention Network architecture (`GATv2Conv → GATv2Conv → FNN`) within TAMPO's `CustomFeaturesExtractor`. The attention mechanism learns task/node importance during message passing, enabling weighted aggregation of neighboring node features rather than the fixed normalization used by GCN. This paper serves as the primary architectural reference for the GCN-to-GAT migration while retaining the existing PPO training pipeline and DAG graph representation.
+
+---

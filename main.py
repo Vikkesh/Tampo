@@ -78,9 +78,12 @@ def get_user_input():
     
     tampo_gcn_run = input("Run TAMPO-GCN? (yes/no): ").strip().lower()
     algorithms['TAMPO_GCN'] = tampo_gcn_run in ['yes', 'y']
-    
+
+    tampo_gat_run = input("Run TAMPO-GAT? (yes/no): ").strip().lower()
+    algorithms['TAMPO_GAT'] = tampo_gat_run in ['yes', 'y']
+
     # Common training/evaluation parameters for RL
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN'], algorithms['TAMPO_GAT']]):
         print("\n\nRL TRAINING & EVALUATION PARAMETERS:")
         print("-" * 40)
         
@@ -97,7 +100,7 @@ def get_user_input():
         else:
             algorithms['gmorl_episodes'] = 100
         
-        if algorithms['TAMPO_LSTM'] or algorithms['TAMPO_GCN']:
+        if algorithms['TAMPO_LSTM'] or algorithms['TAMPO_GCN'] or algorithms['TAMPO_GAT']:
             tampo_iterations = input("Number of meta-iterations for TAMPO (default 100): ").strip()
             algorithms['tampo_iterations'] = int(tampo_iterations) if tampo_iterations else 100
         else:
@@ -132,6 +135,8 @@ def get_user_input():
         selected.append(f"TAMPO_LSTM ({algorithms['tampo_iterations']} meta-iterations)")
     if algorithms['TAMPO_GCN']:
         selected.append(f"TAMPO_GCN ({algorithms['tampo_iterations']} meta-iterations)")
+    if algorithms['TAMPO_GAT']:
+        selected.append(f"TAMPO_GAT ({algorithms['tampo_iterations']} meta-iterations)")
     
     if len(selected) == 0:
         print("\n⚠️  No algorithms selected. Exiting...")
@@ -144,7 +149,7 @@ def get_user_input():
     if any([algorithms['HEFT'], algorithms['PSO'], algorithms['GA']]):
         print(f"\nHeuristic test tasks: {algorithms['heuristic_tasks']}")
     
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN'], algorithms['TAMPO_GAT']]):
         print(f"RL evaluation episodes: {algorithms['eval_episodes']} (common for all RL algorithms)")
     
     print("\n" + "="*70)
@@ -473,7 +478,16 @@ def main():
         )
         if result:
             results['TAMPO_GCN'] = result
-    
+
+    if user_choices['TAMPO_GAT']:
+        result = test_tampo(
+            env, dag_parser, config, evaluator,
+            user_choices['tampo_iterations'],
+            encoder_type='gat'
+        )
+        if result:
+            results['TAMPO_GAT'] = result
+
     # Display detailed comparison using common evaluator
     if len(results) > 0:
         evaluator.compare_algorithms(results)
