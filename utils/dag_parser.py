@@ -101,12 +101,13 @@ class DAGParser:
             print(f"Error parsing {filepath}: {e}")
             return None
     
-    def load_dataset(self, num_graphs: int = 10) -> List[Dict]:
+    def load_dataset(self, num_graphs: int = 10, offset: int = 0) -> List[Dict]:
         """
         Load multiple DAG graphs from the data folder
         
         Args:
             num_graphs: Number of graphs to load
+            offset: Number of files to skip (useful for train/test splits)
             
         Returns:
             List of DAG dictionaries
@@ -117,14 +118,15 @@ class DAGParser:
         gv_files = [f for f in os.listdir(self.data_folder) if f.endswith('.gv')]
         gv_files.sort()
         
-        for i, filename in enumerate(gv_files[:num_graphs]):
+        target_files = gv_files[offset:offset + num_graphs]
+        for i, filename in enumerate(target_files):
             filepath = os.path.join(self.data_folder, filename)
             dag = self.parse_gv_file(filepath)
             
             if dag is not None:
                 graphs.append(dag)
                 
-        print(f"Loaded {len(graphs)} DAG graphs from {self.data_folder}")
+        print(f"Loaded {len(graphs)} DAG graphs from {self.data_folder} (offset={offset})")
         return graphs
     
     def calculate_task_priorities(self, dag: Dict) -> np.ndarray:
