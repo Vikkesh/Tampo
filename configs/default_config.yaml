@@ -22,7 +22,7 @@ environment:
     cloud_power_tx: 0.5
     edge_power_tx: 0.3
     local_power: 0.1
-    kappa: 1.0e-28  # Effective switched capacitance
+    kappa: 1.0e-23  # Effective switched capacitance (scaled so local energy ≈ same order as transmission energy)
 
   # Network Parameters
   network:
@@ -68,8 +68,8 @@ training:
   # Meta-learning
   meta_batch_size: 8
   num_meta_iterations: 300
-  inner_lr: 0.01
-  inner_steps: 3
+  inner_lr: 0.005   # reduced for stable MAML inner-loop adaptation
+  inner_steps: 5    # more steps → better per-task adaptation signal
   
   # Threshold-based communication
   hypervolume_threshold: 0.7
@@ -104,7 +104,7 @@ algorithms:
     hidden_dims: [256, 256]
     num_attention_heads: 8
     encoder_type: 'gcn'  # Options: 'lstm', 'gcn', 'gat'
-    meta_learning_rate: 3.0e-4
+    meta_learning_rate: 5.0e-5  # reduced: second-order MAML gradients are high-variance
     num_meta_iterations: 100
     meta_batch_size: 10
 

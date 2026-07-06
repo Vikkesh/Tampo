@@ -554,7 +554,7 @@ class TaskOffloadingEnv(gym.Env):
             local_energy = self.kappa * self.current_task['cycles'] * (self.local_freq ** 2)
             d_imp = (local_delay - delay) / max(local_delay, 1e-9)
             e_imp = (local_energy - energy) / max(local_energy, 1e-9)
-            return float(np.clip(5.0 * (self.preference[0] * d_imp + self.preference[1] * e_imp), -5.0, 5.0))
+            return float(np.clip(self.preference[0] * d_imp + self.preference[1] * e_imp, -1.0, 1.0))
 
         # True DAG reward
         node_id = self.topo_order[self.current_node_idx]
@@ -590,7 +590,7 @@ class TaskOffloadingEnv(gym.Env):
         combined_delay_metric = comp_imp - (w_cong * congestion_penalty) - (w_comm * comm_penalty)
         total_improvement = self.preference[0] * combined_delay_metric + self.preference[1] * e_imp
 
-        reward = float(np.clip(5.0 * total_improvement, -5.0, 5.0))
+        reward = float(np.clip(total_improvement, -1.0, 1.0))
         return reward
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:

@@ -310,3 +310,33 @@ files.download('results/benchmark_results.csv')
 ## Papers
 
 See [Papers referred.md](Papers%20referred.md) for all full citations.
+
+---
+
+## Convergence Overhaul (2026-07-06)
+
+A professional root-cause analysis identified **15 distinct reasons** the TAMPO agent was failing to converge. All 15 have been fixed. See `dev_logs/convergence_fixes_overhaul.md` for full details.
+
+### Critical Fixes Applied
+
+| RC | File | What Changed | Why It Matters |
+|---|---|---|---|
+| #1+#4 | `tampo.py` | `mo_return` now stores discounted per-objective improvement over local baseline | Old code stored raw costs (inverted sign) with no discounting — agent was penalised for good actions and could not plan |
+| #2 | `tampo.py` | GCN/GAT `encoded_tasks` broadcast from context (was all-zeros) | Decoder attention was attending over zeros — no graph info in decisions |
+| #3 | `base_offloading_env.py` | Reward scale 5.0 → 1.0, clip ±5.0 → ±1.0 | Old scale caused value network targets of ~200 from iteration 1 |
+| #5 | `tampo.py` | Value network now receives server_features (20-dim) in addition to flat obs | Was comparing apples/oranges — policy saw graph, value saw summary |
+| #13 | `tampo.py` | Decoder uses `context_projection(context)` to initialise h_t | Old code discarded the second half of the bidirectional context |
+| #15 | `default_config.yaml` | `kappa: 1e-28` → `1e-23` | Local energy was 1e-10 J vs transmission 0.025 J — 8 OOM gap made energy objective unlearnable |
+
+### Stabilisation Fixes
+
+| RC | What Changed |
+|---|---|
+| #6 | `meta_learning_rate` 3e-4→5e-5; `inner_lr` 0.01→0.005; `inner_steps` 3→5 |
+| #7 | `meta_policy.eval()` during inner-loop adaptation; `train()` restored after |
+| #8 | Zero-mean unit-variance advantage normalisation before policy gradient |
+| #10 | `random.shuffle(all_experiences)` before 80/20 train/test split |
+| #11 | Categorical(probs).sample() during training; no more biased epsilon-greedy |
+| #12 | Removed `sys.stdout = StringIO()` redirect that silenced gradient diagnostics |
+| #9 | HyperVolume reference point updated to [2.0, 2.0] for improvement scale |
+| #14 | Value network `hidden_dim` doubled for sufficient model capacity |

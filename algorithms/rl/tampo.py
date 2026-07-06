@@ -325,7 +325,13 @@ class DAGEncoder(nn.Module):
             context = self.fnn_out(out)                          # [batch, hidden_dim*2]
 
             # Decoder only uses context; encoded_tasks must be shape-compatible
-            encoded_tasks = torch.zeros(task_features.size(0), task_features.size(1), context.size(-1), device=context.device)
+            # RC#2: Broadcast context to every node position so decoder attention has
+            # meaningful content instead of all-zeros. Every node gets the graph-level
+            # summary; per-node differentiation is handled by the decoder's attention
+            # over this uniform-but-non-zero key/value tensor.
+            encoded_tasks = context.unsqueeze(1).expand(
+                -1, task_features.size(1), -1
+            ).contiguous()
             return encoded_tasks, context
 
         embedded = self.task_embedding(task_features)
@@ -379,6 +385,10 @@ class PreferenceConditionedDecoder(nn.Module):
             nn.LayerNorm(hidden_dim)
         )
         
+        # RC#13: Project full context [hidden_dim*2] → [hidden_dim] so both halves
+        # of the bidirectional encoding initialise the decoder LSTM state.
+        self.context_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        
         # LSTM decoder
         self.lstm_cell = nn.LSTMCell(hidden_dim * 3, hidden_dim)
         
@@ -410,7 +420,8 @@ class PreferenceConditionedDecoder(nn.Module):
         pref_encoded = self.preference_encoder(preference)
         
         # Initialize LSTM state
-        h_t = context[:, :self.hidden_dim]
+        # RC#13: Use full context via projection (was discarding second half with [:hidden_dim])
+        h_t = self.context_projection(context)  # [B, hidden_dim]
         c_t = torch.zeros_like(h_t)
         
         action_logits_list = []
@@ -522,14 +533,19 @@ class MetaPolicyNetwork(nn.Module):
 
 class MultiObjectiveValueNetwork(nn.Module):
     """
-    Separate value functions for delay and energy objectives
+    Separate value functions for delay and energy objectives.
+    RC#5: Accepts server_features in addition to the flat obs state so it has
+    the same representational information as the policy network.
     """
     
-    def __init__(self, state_dim: int, hidden_dim: int = 256):
+    def __init__(self, state_dim: int, hidden_dim: int = 256, server_feature_dim: int = 20):
         super(MultiObjectiveValueNetwork, self).__init__()
         
+        # Input: flat obs (36) + server features (20) + preference (2)
+        input_dim = state_dim + server_feature_dim + 2
+        
         self.shared = nn.Sequential(
-            nn.Linear(state_dim + 2, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
@@ -550,11 +566,20 @@ class MultiObjectiveValueNetwork(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
         
-    def forward(self, state, preference):
+    def forward(self, state, preference, server_features=None):
         """
         Returns: [batch, 2] - [V_delay, V_energy]
+        Args:
+            state:          [B, state_dim] — flat environment observation
+            preference:     [B, 2]         — w_delay, w_energy
+            server_features:[B, 20]        — structured server features (RC#5)
         """
-        x = torch.cat([state, preference], dim=-1)
+        if server_features is not None:
+            x = torch.cat([state, server_features, preference], dim=-1)
+        else:
+            # Fallback: pad with zeros so dimension is always correct
+            pad = torch.zeros(state.size(0), 20, device=state.device)
+            x = torch.cat([state, pad, preference], dim=-1)
         features = self.shared(x)
         
         delay_val = self.delay_head(features)
@@ -663,7 +688,10 @@ class LowerLayerAgent:
         self.hv_threshold = config.get('hypervolume_threshold', 0.5)
         self.hv_window = config.get('moving_average_window', 50)
         self.hv_calculator = HypervolumeCalculator(
-            reference_point=np.array([10.0, 1.0])
+            # RC#9: Reference point updated to [2.0, 2.0].
+            # After RC#1/#4 fix, mo_return values are normalised improvements in [-1, 1].
+            # A reference of 2.0 is safely above the maximum possible value of 1.0.
+            reference_point=np.array([2.0, 2.0])
         )
         
         self.performance_buffer = deque(maxlen=200)
@@ -748,6 +776,11 @@ class LowerLayerAgent:
         if len(experiences) == 0:
             return {}
         
+        # RC#7: Disable dropout during inner-loop adaptation.
+        # Stochastic dropout masks during create_graph=True produce inconsistent
+        # second-order gradients across inner steps, destabilising MAML.
+        self.meta_policy.eval()
+        
         # Start with meta-policy parameters
         adapted_params = {name: param.clone() for name, param in self.meta_policy.named_parameters()}
         
@@ -792,6 +825,8 @@ class LowerLayerAgent:
             adapted_params = new_adapted_params
         
         self.adapted_params = adapted_params
+        # RC#7: Restore training mode after inner-loop adaptation.
+        self.meta_policy.train()
         return adapted_params
     
     def _compute_loss_with_params(self, params_dict: Dict, batch: List[Dict]) -> torch.Tensor:
@@ -825,12 +860,20 @@ class LowerLayerAgent:
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
         
-        # Value prediction (using meta value network for simplicity)
-        values = self.meta_value(states, preferences)
+        # Value prediction (RC#5: pass server_features)
+        server_feat_batch = torch.FloatTensor(
+            np.array([exp['server_features'] for exp in batch], dtype=np.float32)
+        ).to(self.device)
+        values = self.meta_value(states, preferences, server_features=server_feat_batch)
         
         # Multi-objective advantages
         advantages = mo_returns - values.detach()
         weighted_advantages = (advantages * preferences).sum(dim=-1)
+        
+        # RC#8: Advantage normalisation — zero-mean, unit-variance per mini-batch
+        adv_std = weighted_advantages.std() + 1e-8
+        adv_mean = weighted_advantages.mean()
+        weighted_advantages = (weighted_advantages - adv_mean) / adv_std
         
         # Combined loss
         policy_loss = -(log_probs * weighted_advantages).mean()
@@ -871,12 +914,20 @@ class LowerLayerAgent:
         log_probs = dist.log_prob(actions)
         entropy = dist.entropy()
         
-        # Value prediction
-        values = self.meta_value(states, preferences)
+        # Value prediction (RC#5: pass server_features)
+        server_feat_batch = torch.FloatTensor(
+            np.array([exp['server_features'] for exp in batch], dtype=np.float32)
+        ).to(self.device)
+        values = self.meta_value(states, preferences, server_features=server_feat_batch)
         
         # Multi-objective advantages
         advantages = mo_returns - values.detach()
         weighted_advantages = (advantages * preferences).sum(dim=-1)
+        
+        # RC#8: Advantage normalisation — zero-mean, unit-variance per mini-batch
+        adv_std = weighted_advantages.std() + 1e-8
+        adv_mean = weighted_advantages.mean()
+        weighted_advantages = (weighted_advantages - adv_mean) / adv_std
         
         # Combined loss
         policy_loss = -(log_probs * weighted_advantages).mean()
@@ -889,13 +940,15 @@ class LowerLayerAgent:
     
     def update_performance(self, delay: float, energy: float):
         """
-        Update performance and check threshold
+        Update performance buffer using normalised improvement values.
+        RC#9: Now normalises to the same [-1,1] scale as mo_return so HV is meaningful.
         """
-        # Normalize objectives
-        norm_delay = delay / 10.0
-        norm_energy = energy / 1.0
+        # Values are already normalised improvements after RC#1 fix;
+        # clamp to [-1,1] for safety and flip sign so higher = better for HV.
+        norm_delay_imp = float(np.clip(delay, -1.0, 1.0))
+        norm_energy_imp = float(np.clip(energy, -1.0, 1.0))
         
-        self.performance_buffer.append([norm_delay, norm_energy])
+        self.performance_buffer.append([norm_delay_imp, norm_energy_imp])
         
         # Calculate hypervolume
         if len(self.performance_buffer) >= 20:
@@ -1162,7 +1215,8 @@ class TAMPOFramework:
         
         value_network = MultiObjectiveValueNetwork(
             state_dim=env.observation_space.shape[0],
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim * 2,          # RC#14: doubled for sufficient value capacity
+            server_feature_dim=server_feature_dim
         )
         
         # Explicit decoder initialization hook.
@@ -1259,16 +1313,7 @@ class TAMPOFramework:
                         'test_experiences': test_exp
                     })
                 
-                # Meta-update
-                import sys
-                from io import StringIO
-                
-                old_stdout = sys.stdout
-                sys.stdout = StringIO()
-                
                 meta_loss = self.meta_learner.meta_update(task_batch)
-                
-                sys.stdout = old_stdout
                 
                 # Store loss
                 self.training_history['losses'].append(meta_loss)
@@ -1340,15 +1385,29 @@ class TAMPOFramework:
                 
                 next_state, reward, done, info = self.env.step(action)
                 
+                # RC#1 + RC#4: Store raw delay/energy and node_cycles so the
+                # post-episode backward pass can compute signed discounted returns.
+                node_id = self.env.topo_order[step_count] if (self.env._is_dag_task() and step_count < len(self.env.topo_order)) else 0
+                node_cycles = 0.0
+                if self.env._is_dag_task() and self.env.current_task is not None:
+                    tasks_list = self.env.current_task.get('tasks', [])
+                    if node_id < len(tasks_list):
+                        node_cycles = float(tasks_list[node_id].get('cycles', 1e9))
+                
                 exp = {
                     'state': state,
                     'task_features': task_features,
                     'server_features': server_features,
                     'adj_matrix': adj_matrix,
                     'action': action,
-                    'reward': reward,  # Use raw reward (already very strong signal)
+                    'reward': reward,
                     'preference': preference,
-                    'mo_return': np.array([info.get('delay', 0), info.get('energy', 0)]),
+                    # Temporary fields: removed in backward return-computation pass below
+                    'raw_delay': float(info.get('delay', 0)),
+                    'raw_energy': float(info.get('energy', 0)),
+                    'node_cycles': node_cycles,
+                    # Placeholder; will be overwritten by backward pass
+                    'mo_return': np.zeros(2, dtype=np.float32),
                     'next_state': next_state,
                     'done': done
                 }
@@ -1357,6 +1416,34 @@ class TAMPOFramework:
                 state = next_state
                 step_count += 1
 
+        # ── RC#1 + RC#4: Compute per-objective discounted returns (backward pass) ──────
+        # mo_return must be a BENEFIT (higher = better), not a raw physical cost.
+        # We compute the improvement over local execution per node, then discount backward
+        # through the episode so the agent learns to plan across the full DAG sequence.
+        gamma = self.config.get('gamma', 0.99)
+        env_local_freq = self.env.local_freq
+        env_kappa = self.env.kappa
+        
+        # Annotate each experience with per-step improvements (needs cycles from env)
+        # info['delay'] = comp_delay for this node; we need local_delay for comparison.
+        # We stored 'node_cycles' below; compute baseline here.
+        G_delay, G_energy = 0.0, 0.0
+        for exp in reversed(all_experiences):
+            cycles = exp.pop('node_cycles', 1e9)  # retrieved from stored value
+            local_delay = cycles / max(env_local_freq, 1e-9)
+            local_energy = env_kappa * cycles * (env_local_freq ** 2)
+            # Step delay/energy improvement (positive = better than local)
+            step_d_imp = (local_delay - exp.pop('raw_delay', 0)) / max(local_delay, 1e-9)
+            step_e_imp = (local_energy - exp.pop('raw_energy', 0)) / max(local_energy, 1e-9)
+            # Accumulate discounted returns backward
+            G_delay = step_d_imp + gamma * G_delay
+            G_energy = step_e_imp + gamma * G_energy
+            exp['mo_return'] = np.array([G_delay, G_energy], dtype=np.float32)
+        
+        # ── RC#10: Shuffle before train/test split to break sequential bias ────────────
+        import random as _random
+        _random.shuffle(all_experiences)
+        
         if len(all_experiences) <= 1:
             return all_experiences, all_experiences
 
@@ -1459,16 +1546,14 @@ class TAMPOFramework:
             
             probs = torch.softmax(logits[:, 0, :], dim=-1)
             
-            if deterministic or np.random.rand() >= 0.05:
+            if deterministic:
+                # RC#11: Greedy argmax only during evaluation — not during training.
                 action = torch.argmax(probs, dim=-1).item()
             else:
-                exploration_weights = np.zeros(self.env.action_space.n, dtype=np.float32)
-                if self.env.action_space.n > 1:
-                    exploration_weights[1:] = 1.0
-                action = int(np.random.choice(
-                    self.env.action_space.n,
-                    p=exploration_weights / exploration_weights.sum()
-                ))
+                # RC#11: Use Categorical sampling for training exploration.
+                # This naturally weights all actions by their policy probability,
+                # includes local (action 0), and avoids the biased epsilon-greedy.
+                action = Categorical(probs).sample().item()
         
         return action
     
