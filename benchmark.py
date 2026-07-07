@@ -82,7 +82,11 @@ def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir, use_best
             else:
                 print(f"  ⚠ No checkpoint found at {checkpoint_path} — using untrained weights.")
 
-            algo_results = evaluator.evaluate_rl_agent(agent, agent_type='tampo')
+            algo_results = evaluator.evaluate_rl_agent(
+                agent,
+                agent_type='tampo',
+                test_dags=test_dataset   # explicit list — same dags, same order for all algos
+            )
             results[algo] = algo_results
 
         else:

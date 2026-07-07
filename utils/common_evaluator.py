@@ -99,70 +99,69 @@ class CommonEvaluator:
         
         return result
     
-    def evaluate_rl_agent(self, agent, agent_type: str) -> Dict:
+    def evaluate_rl_agent(self, agent, agent_type: str,
+                           test_dags: list = None) -> Dict:
         """
         Evaluate RL-based algorithms (PPO, GMORL, TAM-PO)
-        
+
         Args:
-            agent: Agent instance (PPOAgent, GMORLAgent, TAMPOFramework)
+            agent:      Agent instance (PPOAgent, GMORLAgent, TAMPOFramework)
             agent_type: Type of agent ('ppo', 'gmorl', 'tampo')
-            
+            test_dags:  Explicit list of DAG dicts to evaluate on.  Every
+                        algorithm in the same benchmark run receives this SAME
+                        list in the SAME order, guaranteeing a fair comparison.
+                        If None, falls back to the env's loaded task_dataset.
+
         Returns:
             Dictionary with metrics
         """
         print(f"\n📊 Evaluating {agent_type.upper()}...")
-        
-        delays = []
+
+        delays   = []
         energies = []
-        
-        # Evaluate across all preference vectors
-        episodes_per_pref = self.num_episodes // len(self.eval_preferences)
-        
-        for pref_idx, preference in enumerate(self.eval_preferences):
-            for episode in range(episodes_per_pref):
-                # Use fixed seed for this episode
-                episode_idx = pref_idx * episodes_per_pref + episode
-                np.random.seed(self.eval_seeds[episode_idx])
-                
-                if agent_type == 'tampo' and len(getattr(self.env, 'task_dataset', [])) > 0:
-                    task_id = episode_idx % len(self.env.task_dataset)
-                    if hasattr(self.env, 'set_task'):
-                        self.env.set_task(task_id)
-                elif hasattr(self.env, 'clear_task_selection'):
-                    self.env.clear_task_selection()
-                
-                # Reset environment with preference
-                state = self.env.reset(preference_vector=preference)
-                
-                episode_delay = 0
-                episode_energy = 0
-                done = False
+
+        # Determine the DAG pool to evaluate on
+        if test_dags is not None:
+            dags_to_eval = test_dags
+        elif len(getattr(self.env, 'task_dataset', [])) > 0:
+            dags_to_eval = self.env.task_dataset
+        else:
+            print("  ⚠ No test DAGs available — cannot evaluate.")
+            return None
+
+        # Evaluate every (dag, preference) combination.
+        # Each algorithm sees IDENTICAL dags in IDENTICAL order.
+        episode_idx = 0
+        for dag in dags_to_eval:
+            for preference in self.eval_preferences:
+                np.random.seed(1000 + episode_idx)   # reproducible noise per episode
+                episode_idx += 1
+
+                # Hard-reset with the explicit DAG — bypasses set_task() entirely
+                state = self.env.reset(task_graph=dag, preference_vector=preference)
+
+                done  = False
                 steps = 0
-                
+
                 while not done and steps < self.max_steps_per_episode:
-                    # Select action (deterministic for evaluation)
                     action = self._get_action(agent, agent_type, state, preference)
-                    
-                    # Step environment
                     next_state, reward, done, info = self.env.step(action)
-                    
-                    # Accumulate metrics
-                    episode_delay = info.get('makespan', info.get('total_delay', 0))
-                    episode_energy = info.get('total_energy', 0)
-                    
-                    state = next_state
+                    state  = next_state
                     steps += 1
-                
-                delays.append(episode_delay)
-                energies.append(episode_energy)
-        
+
+                # Read final accumulated metrics from the environment
+                delays.append(self.env.total_delay)
+                energies.append(self.env.total_energy)
+
         # Calculate metrics
         result = self._calculate_metrics(delays, energies)
-        
-        print(f"  ✓ Avg Makespan: {result['avg_makespan']:.4f}s")
-        print(f"  ✓ Avg Energy: {result['avg_energy']:.4f}J")
-        
+
+        print(f"  ✓ Episodes      : {len(delays)} ({len(dags_to_eval)} DAGs × {len(self.eval_preferences)} preferences)")
+        print(f"  ✓ Avg Makespan  : {result['avg_makespan']:.4f}s")
+        print(f"  ✓ Avg Energy    : {result['avg_energy']:.6f}J")
+
         return result
+
     
     def _get_action(self, agent, agent_type: str, state: np.ndarray, preference: np.ndarray) -> int:
         """
