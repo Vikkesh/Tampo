@@ -25,7 +25,7 @@ def _load_env_config():
     return config, full_config
 
 
-def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir):
+def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir, use_best=False):
     print("=" * 60)
     print("  TO Algorithm Benchmarking Suite")
     print("=" * 60)
@@ -49,13 +49,33 @@ def run_benchmark(algorithms, checkpoint_dir, dataset_path, output_dir):
         print(f"{'─'*50}")
 
         if algo.startswith("TAMPO"):
-            encoder_type = 'gcn' if 'GCN' in algo.upper() else 'lstm'
+            # Detect encoder type from algorithm name
+            if 'GCN' in algo.upper():
+                encoder_type = 'gcn'
+            elif 'GAT' in algo.upper():
+                encoder_type = 'gat'
+            else:
+                encoder_type = 'lstm'
+
             tampo_config = full_config['algorithms']['tampo'].copy()
             tampo_config['encoder_type'] = encoder_type
 
             agent = TAMPOFramework(env, tampo_config)
-            checkpoint_path = os.path.join(checkpoint_dir,
-                                           f"tampo_{encoder_type}_checkpoint.pth")
+
+            # --use_best loads _best.pth (lowest meta-loss checkpoint) without
+            # touching the regular checkpoint so training can still be resumed.
+            ckpt_name = (f"tampo_{encoder_type}_checkpoint_best.pth"
+                         if use_best
+                         else f"tampo_{encoder_type}_checkpoint.pth")
+            checkpoint_path = os.path.join(checkpoint_dir, ckpt_name)
+
+            # Fallback: if _best.pth requested but doesn't exist, try regular
+            if use_best and not os.path.exists(checkpoint_path):
+                fallback = os.path.join(checkpoint_dir,
+                                        f"tampo_{encoder_type}_checkpoint.pth")
+                print(f"  _best.pth not found — falling back to {fallback}")
+                checkpoint_path = fallback
+
             if os.path.exists(checkpoint_path):
                 agent.load(checkpoint_path)
                 print(f"  Checkpoint loaded: {checkpoint_path}")
@@ -160,7 +180,7 @@ def _print_summary_table(results: dict, evaluator):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark all trained TO algorithms.")
     parser.add_argument("--algorithms", nargs='+',
-                        default=["TAMPO_GCN", "TAMPO_LSTM"],
+                        default=["TAMPO_GCN", "TAMPO_GAT", "TAMPO_LSTM"],
                         help="List of algorithm keys to benchmark")
     parser.add_argument("--checkpoint_dir", type=str, default="models/",
                         help="Directory containing model checkpoint files")
@@ -168,5 +188,10 @@ if __name__ == "__main__":
                         help="Path to the immutable Golden Test Dataset JSON")
     parser.add_argument("--output_dir", type=str, default="results/",
                         help="Directory to write CSV and plots")
+    parser.add_argument("--use_best", action="store_true",
+                        help="Load *_best.pth checkpoints (lowest meta-loss) instead of "
+                             "the regular checkpoint. Falls back to the regular checkpoint "
+                             "if no _best.pth exists. Does NOT overwrite any files.")
     args = parser.parse_args()
-    run_benchmark(args.algorithms, args.checkpoint_dir, args.dataset_path, args.output_dir)
+    run_benchmark(args.algorithms, args.checkpoint_dir, args.dataset_path,
+                  args.output_dir, use_best=args.use_best)
