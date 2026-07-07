@@ -1031,29 +1031,41 @@ class HigherLayerMetaLearner:
     def meta_update(self, task_batch: List[Dict]):
         """
         MAML meta-update: train on adapted policies
-        
-        This implements the proper MAML algorithm following MRLCO:
-        1. For each task, perform inner loop adaptation with create_graph=True
-        2. Compute meta-loss on test set with adapted parameters
-        3. Backpropagate through entire computation graph to meta-policy
-        4. Update meta-policy parameters
+
+        Memory-efficient implementation using per-task backward (gradient
+        accumulation).  Instead of summing all task losses and calling one
+        big backward() — which keeps ALL tasks' computation graphs live
+        simultaneously — we call backward() immediately after each task and
+        let PyTorch accumulate the gradients into .grad attributes.  This
+        reduces peak GPU memory from O(num_tasks × graph_size) to O(1 × graph_size).
         """
-        meta_loss = 0.0
         valid_tasks = 0
         encoder_type = getattr(self.meta_policy.encoder, 'encoder_type', 'lstm')
-        
+
         # Zero gradients before meta-update
         self.meta_optimizer.zero_grad()
 
-        # CuDNN-backed RNN kernels do not support the second-order gradients
-        # required by MAML. Guard the whole meta-update so every LSTM forward
-        # participating in this graph uses the autograd-compatible backend.
+        # LSTM inner loops require the CuDNN-incompatible autograd backend.
+        # GCN / GAT do not need this flag and run faster with CuDNN enabled.
         cudnn_enabled = encoder_type not in {'lstm', 'both'}
+
+        # All encoder types use the same inner_steps from config.
+        # The per-task backward() fix above already reduces peak GPU memory
+        # from O(num_tasks × graph) to O(1 × graph), so LSTM no longer needs
+        # fewer inner steps than GCN/GAT.  Using different inner_steps per
+        # encoder would make the benchmark comparison unfair.
+        # If LSTM still OOMs, reduce meta_batch_size in the training cell
+        # (e.g. 8 instead of 15) — that affects gradient variance, not
+        # per-task adaptation quality.
+        inner_steps = self.config.get('inner_steps', 5)
+
+        running_loss_sum = 0.0
+
         with torch.backends.cudnn.flags(enabled=cudnn_enabled):
             for task_data in task_batch:
                 if len(task_data['test_experiences']) == 0:
                     continue
-                
+
                 # Create temporary agent sharing meta-policy reference
                 temp_agent = LowerLayerAgent(
                     agent_id=-1,
@@ -1062,67 +1074,75 @@ class HigherLayerMetaLearner:
                     config=self.config,
                     device=self.device
                 )
-                
-                # Inner loop adaptation with gradient graph creation
+
+                # Inner loop adaptation
                 adapted_params = None
                 if len(task_data['train_experiences']) > 0:
                     adapted_params = temp_agent.inner_loop_update(
                         task_data['train_experiences'],
-                        num_steps=self.config.get('inner_steps', 3),
-                        create_graph=True  # CRITICAL: Enables second-order gradients
+                        num_steps=inner_steps,
+                        create_graph=True  # second-order gradients for proper MAML
                     )
-                
-                # Compute test loss with adapted parameters
+
                 if len(task_data['test_experiences']) > 0 and adapted_params is not None:
-                    test_loss = temp_agent._compute_loss_with_params(
+                    # Normalise by total valid tasks so the scale is consistent
+                    # regardless of how many tasks had experiences.
+                    n_tasks = max(sum(
+                        1 for t in task_batch
+                        if len(t['test_experiences']) > 0 and len(t.get('train_experiences', [])) > 0
+                    ), 1)
+
+                    task_loss = temp_agent._compute_loss_with_params(
                         adapted_params,
                         task_data['test_experiences']
-                    )
-                    meta_loss = meta_loss + test_loss
+                    ) / n_tasks
+
+                    # ── KEY FIX: backward immediately so the graph is freed ──
+                    # retain_graph=False (default) lets PyTorch free the computation
+                    # graph as soon as backward() completes.  Gradients accumulate
+                    # in .grad attributes across tasks just like mini-batch accumulation.
+                    task_loss.backward()
+
+                    running_loss_sum += task_loss.item()
                     valid_tasks += 1
-            
-            if valid_tasks == 0:
-                print("WARNING: No valid tasks for meta-update!")
-                return 0.0
-            
-            # Average meta-loss across tasks
-            meta_loss = meta_loss / valid_tasks
-            
-            # Backpropagate through entire computation graph
-            meta_loss.backward()
-        
-        # Check if gradients are flowing properly
-        print("\n=== Meta-Gradient Check ===")
-        any_grad = False
-        total_grad_norm = 0.0
-        for name, p in self.meta_policy.named_parameters():
-            if p.grad is not None:
-                grad_norm = p.grad.norm().item()
-                if grad_norm > 1e-8:  # Only print non-negligible gradients
-                    print(f"  {name}: grad_norm = {grad_norm:.6f}")
-                total_grad_norm += grad_norm
-                any_grad = True
-        
-        print(f"  Total grad norm: {total_grad_norm:.6f}")
-        print(f"  Any meta grads? {any_grad}")
-        print("=" * 30 + "\n")
-        
+
+                    # Free cached allocations between tasks so fragmentation
+                    # doesn't cause false OOMs on the NEXT task's forward pass.
+                    if self.device.type == 'cuda':
+                        torch.cuda.empty_cache()
+
+        if valid_tasks == 0:
+            print("WARNING: No valid tasks for meta-update!")
+            return 0.0
+
+        avg_meta_loss = running_loss_sum  # already divided by n_tasks per task
+
+        # Gradient diagnostics — only printed every 10 iterations to reduce noise.
+        # The training loop already prints loss/avg every 5 iterations.
+        total_grad_norm = sum(
+            p.grad.norm().item()
+            for p in self.meta_policy.parameters()
+            if p.grad is not None
+        )
+        any_grad = total_grad_norm > 0
+
         if not any_grad:
-            print("WARNING: No gradients detected! Check:")
-            print("  1. Are train/test experiences non-empty?")
-            print("  2. Is create_graph=True in inner loop?")
-            print("  3. Are losses computed correctly?")
-        
+            print("WARNING: No gradients detected in meta-update! Check inner loop.")
+        else:
+            # Compact single-line summary instead of per-parameter spam
+            print(f"  [meta] grad_norm_total={total_grad_norm:.4f}  tasks={valid_tasks}  inner_steps={inner_steps}")
+
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
             list(self.meta_policy.parameters()) + list(self.value_network.parameters()),
             max_norm=1.0
         )
-        
+
         # Meta-optimizer step
         self.meta_optimizer.step()
-        
-        return meta_loss.item()
+
+        return avg_meta_loss
+
 
     def collect_updates(self) -> List[Dict]:
         """Collect threshold-triggered updates"""
