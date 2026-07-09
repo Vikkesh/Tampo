@@ -5,6 +5,7 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.dag_parser import DAGParser
+from utils.training_setup import TRAIN_SIZES
 
 def generate_golden_dataset(num_dags: int, output_file: str):
     print(f"Generating Golden Dataset of {num_dags} DAGs from meta_offloading_n...")
@@ -25,7 +26,8 @@ def generate_golden_dataset(num_dags: int, output_file: str):
     ]
 
     # Sample equally from each size bucket
-    per_folder = max(1, num_dags // len(folders))
+    import math
+    per_folder = max(1, math.ceil(num_dags / len(folders)))
     dataset = []
 
     for folder in folders:
@@ -60,9 +62,16 @@ def generate_golden_dataset(num_dags: int, output_file: str):
         json.dump(serialised_dataset, f, indent=2)
 
     print(f"Dataset of {len(serialised_dataset)} DAGs saved → {output_file}")
-    print(f"\nSize breakdown: ~{per_folder} graphs per size × {len(folders)} sizes")
-    print(f"  Train-seen sizes  (10–30):  {per_folder * 5} graphs")
-    print(f"  Zero-shot sizes   (35–50):  {per_folder * 4} graphs  ← agent never trained on these")
+    
+    # Calculate actual size breakdown from the saved dataset using the TRAIN_SIZES config
+    seen_sizes = set(TRAIN_SIZES)
+    num_seen = sum(1 for g in serialised_dataset if g['num_tasks'] in seen_sizes)
+    num_unseen = len(serialised_dataset) - num_seen
+    
+    print(f"\nSize breakdown of the saved dataset:")
+    print(f"  Train-seen sizes:             {num_seen} graphs")
+    if num_unseen > 0:
+        print(f"  Zero-shot (unseen) sizes:     {num_unseen} graphs")
 
 
 if __name__ == "__main__":
