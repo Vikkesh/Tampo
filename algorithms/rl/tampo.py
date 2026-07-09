@@ -656,7 +656,14 @@ class HypervolumeCalculator:
         
         return solutions[is_pareto]
 
+
+class _LossCallCounter:
+    """Module-level counter for throttled diagnostic logging in _compute_loss_with_params."""
+    _n: int = 0
+
+
 class LowerLayerAgent:
+
     """
     Lower-layer device agent with local adaptation (MAML inner loop)
     """
@@ -884,10 +891,26 @@ class LowerLayerAgent:
         policy_loss  = -(log_probs * weighted_advantages).mean()
         value_loss   = ((mo_returns - values) ** 2).mean(dim=-1).mean()
         entropy_loss = -entropy.mean()
-        
+
+        # ── Diagnostic: log component breakdown every 50 loss computations ──────────
+        # Reveals which term dominates and whether returns are in a sane range.
+        # Guarded by a module-level counter so it doesn't spam on every inner step.
+        _LossCallCounter._n = getattr(_LossCallCounter, '_n', 0) + 1
+        if _LossCallCounter._n % 50 == 1:
+            avg_ret_d = mo_returns[:, 0].abs().mean().item()
+            avg_ret_e = mo_returns[:, 1].abs().mean().item()
+            print(
+                f"    [diag] returns |G_d|={avg_ret_d:.3f}  |G_e|={avg_ret_e:.3f}"
+                f"  policy={policy_loss.item():.4f}"
+                f"  value={value_loss.item():.4f}"
+                f"  entropy={entropy_loss.item():.4f}"
+            )
+
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
         
         return total_loss
+
+
 
 
     def _compute_loss(self, batch: List[Dict]) -> torch.Tensor:
@@ -1124,7 +1147,6 @@ class HigherLayerMetaLearner:
         avg_meta_loss = running_loss_sum  # already divided by n_tasks per task
 
         # Gradient diagnostics — only printed every 10 iterations to reduce noise.
-        # The training loop already prints loss/avg every 5 iterations.
         total_grad_norm = sum(
             p.grad.norm().item()
             for p in self.meta_policy.parameters()
@@ -1135,7 +1157,6 @@ class HigherLayerMetaLearner:
         if not any_grad:
             print("WARNING: No gradients detected in meta-update! Check inner loop.")
         else:
-            # Compact single-line summary instead of per-parameter spam
             print(f"  [meta] grad_norm_total={total_grad_norm:.4f}  tasks={valid_tasks}  inner_steps={inner_steps}")
 
         # Gradient clipping
@@ -1444,32 +1465,44 @@ class TAMPOFramework:
 
         # ── RC#1 + RC#4: Compute per-objective discounted returns (backward pass) ──────
         # mo_return must be a BENEFIT (higher = better), not a raw physical cost.
-        # We compute the improvement over local execution per node, then discount backward
-        # through the episode so the agent learns to plan across the full DAG sequence.
+        # IMPORTANT: G MUST reset between episodes. Without resetting, returns from
+        # episode N bleed backwards into episode N-1, inflating returns by up to
+        # num_episodes * correct_return and making the value network impossible to train.
         gamma = self.config.get('gamma', 0.99)
         env_local_freq = self.env.local_freq
         env_kappa = self.env.kappa
-        
-        # Annotate each experience with per-step improvements (needs cycles from env)
-        # info['delay'] = comp_delay for this node; we need local_delay for comparison.
-        # We stored 'node_cycles' below; compute baseline here.
-        G_delay, G_energy = 0.0, 0.0
-        for exp in reversed(all_experiences):
-            cycles = exp.pop('node_cycles', 1e9)  # retrieved from stored value
-            local_delay = cycles / max(env_local_freq, 1e-9)
-            local_energy = env_kappa * cycles * (env_local_freq ** 2)
-            # Step delay/energy improvement (positive = better than local)
-            step_d_imp = (local_delay - exp.pop('raw_delay', 0)) / max(local_delay, 1e-9)
-            step_e_imp = (local_energy - exp.pop('raw_energy', 0)) / max(local_energy, 1e-9)
-            # Accumulate discounted returns backward
-            G_delay = step_d_imp + gamma * G_delay
-            G_energy = step_e_imp + gamma * G_energy
-            exp['mo_return'] = np.array([G_delay, G_energy], dtype=np.float32)
-        
+
+        # Split experiences back into per-episode groups by detecting done=True
+        episodes: list = []
+        current_ep: list = []
+        for exp in all_experiences:
+            current_ep.append(exp)
+            if exp['done']:          # episode boundary
+                episodes.append(current_ep)
+                current_ep = []
+        if current_ep:               # last episode if env didn't set done
+            episodes.append(current_ep)
+
+        # Compute discounted returns within each episode independently
+        for ep_exps in episodes:
+            G_delay, G_energy = 0.0, 0.0          # reset per episode
+            for exp in reversed(ep_exps):
+                cycles = exp.pop('node_cycles', 1e9)
+                local_delay  = cycles / max(env_local_freq, 1e-9)
+                local_energy = env_kappa * cycles * (env_local_freq ** 2)
+                step_d_imp = (local_delay  - exp.pop('raw_delay',  0)) / max(local_delay,  1e-9)
+                step_e_imp = (local_energy - exp.pop('raw_energy', 0)) / max(local_energy, 1e-9)
+                G_delay  = step_d_imp + gamma * G_delay
+                G_energy = step_e_imp + gamma * G_energy
+                exp['mo_return'] = np.array([G_delay, G_energy], dtype=np.float32)
+
+        # Flatten all episodes back into a single list for the train/test split
+        all_experiences = [exp for ep_exps in episodes for exp in ep_exps]
+
         # ── RC#10: Shuffle before train/test split to break sequential bias ────────────
         import random as _random
         _random.shuffle(all_experiences)
-        
+
         if len(all_experiences) <= 1:
             return all_experiences, all_experiences
 
@@ -1478,7 +1511,7 @@ class TAMPOFramework:
             split = len(all_experiences) - 1
 
         train_experiences = all_experiences[:split]
-        test_experiences = all_experiences[split:]
+        test_experiences  = all_experiences[split:]
         return train_experiences, test_experiences
     
     def _sample_preference(self) -> np.ndarray:
