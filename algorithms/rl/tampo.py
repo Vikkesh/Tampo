@@ -876,13 +876,19 @@ class LowerLayerAgent:
         weighted_advantages = (weighted_advantages - adv_mean) / adv_std
         
         # Combined loss
-        policy_loss = -(log_probs * weighted_advantages).mean()
-        value_loss = ((mo_returns - values) ** 2).sum(dim=-1).mean()
+        # NOTE: .mean(dim=-1) not .sum(dim=-1) for value_loss.
+        # mo_returns / values are shape (batch, 2). .sum() over dim=-1 multiplies
+        # the MSE by the number of objectives, ballooning value_loss to dominate
+        # the gradient and causing divergence. .mean() keeps both objectives
+        # equally weighted and in the same scale as policy_loss.
+        policy_loss  = -(log_probs * weighted_advantages).mean()
+        value_loss   = ((mo_returns - values) ** 2).mean(dim=-1).mean()
         entropy_loss = -entropy.mean()
         
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
         
         return total_loss
+
 
     def _compute_loss(self, batch: List[Dict]) -> torch.Tensor:
         """
@@ -928,14 +934,14 @@ class LowerLayerAgent:
         adv_std = weighted_advantages.std() + 1e-8
         adv_mean = weighted_advantages.mean()
         weighted_advantages = (weighted_advantages - adv_mean) / adv_std
-        
-        # Combined loss
-        policy_loss = -(log_probs * weighted_advantages).mean()
-        value_loss = ((mo_returns - values) ** 2).sum(dim=-1).mean()
+
+        # Combined loss — same .mean(dim=-1) fix as _compute_loss_with_params
+        policy_loss  = -(log_probs * weighted_advantages).mean()
+        value_loss   = ((mo_returns - values) ** 2).mean(dim=-1).mean()
         entropy_loss = -entropy.mean()
-        
+
         total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
-        
+
         return total_loss
     
     def update_performance(self, delay: float, energy: float):
