@@ -204,54 +204,34 @@ class CommonEvaluator:
     def _calculate_metrics(self, delays: List[float], energies: List[float]) -> Dict:
         """
         Calculate standardized metrics
-        
-        Args:
-            delays: List of delay values
-            energies: List of energy values
-            
-        Returns:
-            Dictionary with metrics
+
+        NOTE: No outlier filtering is applied.  Removing different numbers of
+        episodes per algorithm makes the averages non-comparable — an "outlier"
+        for LSTM is a real evaluation episode that GCN also ran on.  All episodes
+        are included so every algorithm is scored on identical data.
         """
-        delays = np.array(delays)
+        delays   = np.array(delays)
         energies = np.array(energies)
-        
-        # Remove outliers (>3 std dev)
-        delay_mean = np.mean(delays)
-        delay_std = np.std(delays)
-        energy_mean = np.mean(energies)
-        energy_std = np.std(energies)
-        
-        # Filter outliers
-        delay_mask = np.abs(delays - delay_mean) <= 3 * delay_std
-        energy_mask = np.abs(energies - energy_mean) <= 3 * energy_std
-        valid_mask = delay_mask & energy_mask
-        
-        if np.sum(valid_mask) < len(delays) * 0.8:
-            # If too many outliers, don't filter
-            valid_delays = delays
-            valid_energies = energies
-        else:
-            valid_delays = delays[valid_mask]
-            valid_energies = energies[valid_mask]
-        
+
         metrics = {
-            'avg_makespan': np.mean(valid_delays),
-            'std_makespan': np.std(valid_delays),
-            'min_makespan': np.min(valid_delays),
-            'max_makespan': np.max(valid_delays),
-            'median_makespan': np.median(valid_delays),
-            
-            'avg_energy': np.mean(valid_energies),
-            'std_energy': np.std(valid_energies),
-            'min_energy': np.min(valid_energies),
-            'max_energy': np.max(valid_energies),
-            'median_energy': np.median(valid_energies),
-            
-            'num_episodes': len(valid_delays),
-            'num_outliers_removed': len(delays) - len(valid_delays)
+            'avg_makespan':    np.mean(delays),
+            'std_makespan':    np.std(delays),
+            'min_makespan':    np.min(delays),
+            'max_makespan':    np.max(delays),
+            'median_makespan': np.median(delays),
+
+            'avg_energy':    np.mean(energies),
+            'std_energy':    np.std(energies),
+            'min_energy':    np.min(energies),
+            'max_energy':    np.max(energies),
+            'median_energy': np.median(energies),
+
+            'num_episodes':        len(delays),
+            'num_outliers_removed': 0,   # no longer filtered
         }
-        
+
         return metrics
+
     
     def compare_algorithms(self, results: Dict[str, Dict]) -> None:
         """
