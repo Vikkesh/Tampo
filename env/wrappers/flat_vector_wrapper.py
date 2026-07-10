@@ -14,10 +14,15 @@ class FlatVectorWrapper(gym.Wrapper):
 
     SERVER_FEATURE_DIM = 20   # matches TaskOffloadingEnv.get_server_features() hard cap
 
-    def __init__(self, env, max_tasks: int = 30, task_feature_dim: int = 6):
+    def __init__(self, env, max_tasks: int = 30, task_feature_dim: int = None):
         super().__init__(env)
         self.max_tasks = max_tasks
-        self.task_feature_dim = task_feature_dim
+        # Default to the env's own width rather than a literal, so adding a node feature
+        # cannot silently truncate or mis-shape the flattened observation.
+        self.task_feature_dim = (
+            task_feature_dim if task_feature_dim is not None
+            else getattr(env, 'task_feature_dim', 9)
+        )
 
         flat_dim = (self.max_tasks * self.task_feature_dim) + self.SERVER_FEATURE_DIM
 

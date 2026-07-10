@@ -129,10 +129,15 @@ class CommonEvaluator:
             print("  ⚠ No test DAGs available — cannot evaluate.")
             return None
 
+        # Per-episode action traces, so the reported metrics can be traced back to the
+        # placements that produced them.  A policy that emits one action for every node
+        # is degenerate; without this you cannot see that from makespan/energy alone.
+        action_traces = []
+
         # Evaluate every (dag, preference) combination.
         # Each algorithm sees IDENTICAL dags in IDENTICAL order.
         episode_idx = 0
-        for dag in dags_to_eval:
+        for dag_idx, dag in enumerate(dags_to_eval):
             for preference in self.eval_preferences:
                 np.random.seed(1000 + episode_idx)   # reproducible noise per episode
                 episode_idx += 1
@@ -142,25 +147,101 @@ class CommonEvaluator:
 
                 done  = False
                 steps = 0
+                actions = []
 
                 while not done and steps < self.max_steps_per_episode:
                     action = self._get_action(agent, agent_type, state, preference)
                     next_state, reward, done, info = self.env.step(action)
+                    actions.append(int(action))
                     state  = next_state
                     steps += 1
 
                 # Read final accumulated metrics from the environment
                 delays.append(self.env.total_delay)
                 energies.append(self.env.total_energy)
+                action_traces.append({
+                    'dag_index': dag_idx,
+                    'num_tasks': len(actions),
+                    'w_delay': float(preference[0]),
+                    'w_energy': float(preference[1]),
+                    'actions': actions,
+                    'makespan': float(self.env.total_delay),
+                    'energy': float(self.env.total_energy),
+                })
 
         # Calculate metrics
         result = self._calculate_metrics(delays, energies)
+        result['action_traces'] = action_traces
+        result['action_summary'] = self._summarize_actions(action_traces)
 
         print(f"  ✓ Episodes      : {len(delays)} ({len(dags_to_eval)} DAGs × {len(self.eval_preferences)} preferences)")
         print(f"  ✓ Avg Makespan  : {result['avg_makespan']:.4f}s")
         print(f"  ✓ Avg Energy    : {result['avg_energy']:.6f}J")
+        self._print_action_summary(result['action_summary'])
 
         return result
+
+    ACTION_NAMES = ['local', 'cloud', 'edge0', 'edge1', 'edge2']
+
+    def _action_label(self, action: int) -> str:
+        if action < len(self.ACTION_NAMES):
+            return self.ACTION_NAMES[action]
+        return f"srv{action}"
+
+    def _summarize_actions(self, traces: List[Dict]) -> Dict:
+        """
+        Aggregate action usage overall and per preference vector.
+
+        `per_episode_entropy` is the mean normalised entropy of the action distribution
+        WITHIN an episode.  0.0 means the agent placed every node of a DAG on the same
+        server — the degenerate policy.  This is the number that reveals whether the
+        agent is scheduling or just picking one server per graph.
+        """
+        n_actions = self.env.action_space.n
+        overall = np.zeros(n_actions, dtype=np.int64)
+        per_pref = {}
+        episode_entropies = []
+
+        for tr in traces:
+            counts = np.bincount(tr['actions'], minlength=n_actions).astype(np.int64)
+            overall += counts
+
+            key = (tr['w_delay'], tr['w_energy'])
+            per_pref.setdefault(key, np.zeros(n_actions, dtype=np.int64))
+            per_pref[key] += counts
+
+            total = counts.sum()
+            if total > 0 and n_actions > 1:
+                p = counts[counts > 0] / total
+                episode_entropies.append(float(-(p * np.log(p)).sum() / np.log(n_actions)))
+
+        def _frac(c):
+            t = c.sum()
+            return (c / t).tolist() if t else [0.0] * n_actions
+
+        return {
+            'overall_fractions': _frac(overall),
+            'per_preference_fractions': {f"{k[0]:.1f}/{k[1]:.1f}": _frac(v) for k, v in per_pref.items()},
+            'mean_per_episode_entropy': float(np.mean(episode_entropies)) if episode_entropies else 0.0,
+            'degenerate_episodes': int(sum(1 for e in episode_entropies if e < 1e-9)),
+            'total_episodes': len(traces),
+        }
+
+    def _print_action_summary(self, summary: Dict) -> None:
+        n = len(summary['overall_fractions'])
+        names = " ".join(
+            f"{self._action_label(a)}={summary['overall_fractions'][a]*100:4.1f}%" for a in range(n)
+        )
+        print(f"  ✓ Actions       : {names}")
+        print(f"  ✓ Within-episode entropy: {summary['mean_per_episode_entropy']:.3f} "
+              f"(0 = one server for the whole DAG, 1 = uniform)")
+        if summary['degenerate_episodes']:
+            print(f"  ⚠ {summary['degenerate_episodes']}/{summary['total_episodes']} episodes "
+                  f"placed EVERY node on a single server — policy is degenerate.")
+        print("    Action mix per preference (delay/energy):")
+        for pref, fracs in summary['per_preference_fractions'].items():
+            mix = " ".join(f"{self._action_label(a)}={fracs[a]*100:4.1f}%" for a in range(n))
+            print(f"      {pref:>8s} → {mix}")
 
     
     def _get_action(self, agent, agent_type: str, state: np.ndarray, preference: np.ndarray) -> int:

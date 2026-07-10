@@ -11,6 +11,8 @@ from torch_geometric.utils import to_dense_batch
 from collections import deque
 import copy
 import os
+import time
+import random
 
 def _pad_graph_batch(
     task_features_list: List[np.ndarray],
@@ -61,6 +63,16 @@ def _build_pyg_batch(
 
     return Batch.from_data_list(data_list)
 
+
+def action_name(action: int) -> str:
+    """Human-readable name for an offloading action index."""
+    if action == 0:
+        return "local"
+    if action == 1:
+        return "cloud"
+    return f"edge{action - 2}"
+
+
 class DAGEncoder(nn.Module):
     """
     Enhanced encoder for DAG structure using LSTM or GCN approach.
@@ -75,7 +87,8 @@ class DAGEncoder(nn.Module):
         server_feature_dim: int = 20,
         num_gat_heads: int = 4,
         gat_hidden_dim: int = 16,
-        gat_add_self_loops: bool = True
+        gat_add_self_loops: bool = True,
+        gnn_hidden_dim: int = 16
     ):
         super(DAGEncoder, self).__init__()
 
@@ -99,37 +112,33 @@ class DAGEncoder(nn.Module):
                 bidirectional=True,
                 dropout=0.1 if num_layers > 1 else 0
             )
+        # ── GNN node-embedding width ───────────────────────────────────────────────
+        # Each directional stream emits `hidden_dim` per node; forward ⊕ backward gives
+        # `hidden_dim * 2`, matching the decoder's attention embed_dim and the LSTM
+        # encoder's BiLSTM output width. This keeps GCN / GAT / LSTM interchangeable.
+        #
+        # GDRL's Feature.py ends with GCNConv(16, 1) and concatenates the resulting
+        # [num_nodes] vector with the scalar state — it keeps one value PER NODE. The
+        # previous code here collapsed that to `x.mean()`, a single scalar for the whole
+        # graph, then broadcast it to every node slot. Attention then ran over N
+        # identical keys, so no per-node information reached the decoder at all. We keep
+        # per-node outputs (as GDRL does) and widen the final conv from 1 to hidden_dim
+        # so the decoder has something to attend over.
         if self.encoder_type == 'gcn':
-            # GDRL Feature.py architecture mapping (Upgraded to Bi-Directional)
-            self.gnn1_fwd = GCNConv(task_feature_dim, 16)
-            self.gnn2_fwd = GCNConv(16, 1)
+            self.gnn1_fwd = GCNConv(task_feature_dim, gnn_hidden_dim)
+            self.gnn2_fwd = GCNConv(gnn_hidden_dim, hidden_dim)
 
-            self.gnn1_bwd = GCNConv(task_feature_dim, 16)
-            self.gnn2_bwd = GCNConv(16, 1)
-
-            fnn_in = server_feature_dim + 2
-            self.fnn1 = nn.Sequential(
-                nn.Linear(fnn_in, 128),
-                nn.ReLU(),
-                nn.Linear(128, 64),
-            )
-            self.fnn_out = nn.Sequential(
-                nn.Linear(64, 64),
-                nn.ReLU(),
-                nn.Linear(64, hidden_dim * 2),
-                nn.ReLU()
-            )
+            self.gnn1_bwd = GCNConv(task_feature_dim, gnn_hidden_dim)
+            self.gnn2_bwd = GCNConv(gnn_hidden_dim, hidden_dim)
         elif self.encoder_type == 'gat':
-            # Bi-GATv2 architecture — drop-in for Bi-GCN (GAPO, Zhang et al. 2025)
-            # Layer 1: concat=True  → out = hidden_per_head * heads = gat_hidden_dim
-            # Layer 2: heads=1, concat=False → out = 1 → squeeze → mean pool → scalar
+            # Bi-GATv2 — drop-in for Bi-GCN, identical skeleton, only the conv differs.
             hidden_per_head = gat_hidden_dim // num_gat_heads
             self.gat1_fwd = GATv2Conv(
                 task_feature_dim, hidden_per_head, heads=num_gat_heads,
                 concat=True, dropout=0.1, add_self_loops=gat_add_self_loops
             )
             self.gat2_fwd = GATv2Conv(
-                gat_hidden_dim, 1, heads=1,
+                gat_hidden_dim, hidden_dim, heads=1,
                 concat=False, dropout=0.1, add_self_loops=gat_add_self_loops
             )
             self.gat1_bwd = GATv2Conv(
@@ -137,11 +146,15 @@ class DAGEncoder(nn.Module):
                 concat=True, dropout=0.1, add_self_loops=gat_add_self_loops
             )
             self.gat2_bwd = GATv2Conv(
-                gat_hidden_dim, 1, heads=1,
+                gat_hidden_dim, hidden_dim, heads=1,
                 concat=False, dropout=0.1, add_self_loops=gat_add_self_loops
             )
 
-            fnn_in = server_feature_dim + 2
+        if self.encoder_type in {'gcn', 'gat'}:
+            # Graph-level context: mean readout over node embeddings, concatenated with
+            # the server state, through GDRL's two-block FNN head. The readout replaces
+            # GDRL's fixed-size concatenation, which assumes a constant node count (35).
+            fnn_in = server_feature_dim + hidden_dim * 2
             self.fnn1 = nn.Sequential(
                 nn.Linear(fnn_in, 128),
                 nn.ReLU(),
@@ -153,6 +166,7 @@ class DAGEncoder(nn.Module):
                 nn.Linear(64, hidden_dim * 2),
                 nn.ReLU()
             )
+            self.node_norm = nn.LayerNorm(hidden_dim * 2)
         elif self.encoder_type == 'both':
             # Legacy both branch, kept for structural integrity if used elsewhere
             self.gcn_layers = nn.ModuleList([
@@ -224,80 +238,54 @@ class DAGEncoder(nn.Module):
             )
             return dense_x, node_mask
 
-        # GDRL 'gcn' path
-        import torch.nn.functional as F
-        x_list = []
-        # graph_batch.batch contains graph ID per node
-        unique_graphs = torch.unique(graph_batch.batch, sorted=True)
-        for graph_id in unique_graphs:
-            mask = graph_batch.batch == graph_id
-            x_i = graph_batch.x[mask]                      # [N_i, 6]
-
-            # Extract local edge_index for this graph
-            node_offset = mask.nonzero(as_tuple=False)[0].item()
-            local_edges_fwd = graph_batch.edge_index[:, 
-                (graph_batch.edge_index[0] >= node_offset) & 
-                (graph_batch.edge_index[0] < node_offset + x_i.size(0))
-            ] - node_offset
-            
-            local_edges_bwd = local_edges_fwd[[1, 0]]
-
-            # Forward pass
-            x_fwd = self.gnn1_fwd(x_i, local_edges_fwd)
-            x_fwd = F.relu(x_fwd)
-            x_fwd = F.dropout(x_fwd, training=self.training)
-            x_fwd = self.gnn2_fwd(x_fwd, local_edges_fwd).squeeze(1)  # [N_i]
-            
-            # Backward pass
-            x_bwd = self.gnn1_bwd(x_i, local_edges_bwd)
-            x_bwd = F.relu(x_bwd)
-            x_bwd = F.dropout(x_bwd, training=self.training)
-            x_bwd = self.gnn2_bwd(x_bwd, local_edges_bwd).squeeze(1)  # [N_i]
-
-            # Mean pool both streams and combine
-            summary = torch.stack([x_fwd.mean(), x_bwd.mean()]) # [2]
-            x_list.append(summary)
-
-        # Return the aggregated graphs, node_mask is None since we bypass attention
-        return torch.stack(x_list).unsqueeze(1), None
+        # GDRL 'gcn' path — bidirectional, per-node outputs (no pooling)
+        return self._apply_bidirectional_gnn(
+            graph_batch, max_num_nodes,
+            self.gnn1_fwd, self.gnn2_fwd, self.gnn1_bwd, self.gnn2_bwd
+        )
 
     def _apply_gat(self, graph_batch, max_num_nodes: int):
         """Bi-GATv2 forward pass — drop-in replacement for Bi-GCN (GAPO, Zhang et al. 2025)."""
         if graph_batch is None:
             raise ValueError("graph_batch is required for GAT-based encoders")
 
+        return self._apply_bidirectional_gnn(
+            graph_batch, max_num_nodes,
+            self.gat1_fwd, self.gat2_fwd, self.gat1_bwd, self.gat2_bwd
+        )
+
+    def _apply_bidirectional_gnn(self, graph_batch, max_num_nodes, l1_fwd, l2_fwd, l1_bwd, l2_bwd):
+        """
+        Shared Bi-GNN body for the 'gcn' and 'gat' paths — the ONLY difference between
+        them is the conv operator passed in, which is what makes the GCN-vs-GAT
+        comparison a controlled experiment.
+
+        Runs two streams over the whole PyG batch at once (the previous per-graph Python
+        loop was correct but O(batch_size) sequential conv calls), then scatters back to
+        a dense [B, N_max, hidden*2] tensor.
+
+        Returns:
+            dense_nodes: [B, N_max, hidden_dim * 2] per-node embeddings
+            node_mask:   [B, N_max] True where a real node lives
+        """
         import torch.nn.functional as F
-        x_list = []
-        unique_graphs = torch.unique(graph_batch.batch, sorted=True)
-        for graph_id in unique_graphs:
-            mask = graph_batch.batch == graph_id
-            x_i = graph_batch.x[mask]                      # [N_i, task_feature_dim]
 
-            node_offset = mask.nonzero(as_tuple=False)[0].item()
-            local_edges_fwd = graph_batch.edge_index[:,
-                (graph_batch.edge_index[0] >= node_offset) &
-                (graph_batch.edge_index[0] < node_offset + x_i.size(0))
-            ] - node_offset
+        x = graph_batch.x
+        edge_fwd = graph_batch.edge_index          # parent → child (DAG direction)
+        edge_bwd = edge_fwd.flip(0)                # child → parent
 
-            local_edges_bwd = local_edges_fwd[[1, 0]]
+        h_fwd = F.dropout(F.relu(l1_fwd(x, edge_fwd)), training=self.training)
+        h_fwd = l2_fwd(h_fwd, edge_fwd)            # [total_nodes, hidden_dim]
 
-            # Forward stream (DAG direction: parent → child)
-            x_fwd = self.gat1_fwd(x_i, local_edges_fwd)   # [N_i, gat_hidden_dim]
-            x_fwd = F.relu(x_fwd)
-            x_fwd = F.dropout(x_fwd, training=self.training)
-            x_fwd = self.gat2_fwd(x_fwd, local_edges_fwd).squeeze(1)  # [N_i]
+        h_bwd = F.dropout(F.relu(l1_bwd(x, edge_bwd)), training=self.training)
+        h_bwd = l2_bwd(h_bwd, edge_bwd)            # [total_nodes, hidden_dim]
 
-            # Backward stream (reversed DAG: child → parent)
-            x_bwd = self.gat1_bwd(x_i, local_edges_bwd)   # [N_i, gat_hidden_dim]
-            x_bwd = F.relu(x_bwd)
-            x_bwd = F.dropout(x_bwd, training=self.training)
-            x_bwd = self.gat2_bwd(x_bwd, local_edges_bwd).squeeze(1)  # [N_i]
+        h = torch.cat([h_fwd, h_bwd], dim=-1)      # [total_nodes, hidden_dim * 2]
 
-            # Mean pool both streams → [2] graph summary
-            summary = torch.stack([x_fwd.mean(), x_bwd.mean()])
-            x_list.append(summary)
-
-        return torch.stack(x_list).unsqueeze(1), None
+        dense_nodes, node_mask = to_dense_batch(
+            h, graph_batch.batch, max_num_nodes=max_num_nodes
+        )
+        return dense_nodes, node_mask
 
     def forward(self, task_features, adjacency_matrix=None, node_mask=None, graph_batch=None, server_features=None):
         """
@@ -315,23 +303,19 @@ class DAGEncoder(nn.Module):
         if self.encoder_type in {'gcn', 'gat'}:
             if server_features is None:
                 raise ValueError("server_features is required for GCN/GAT path")
-            if self.encoder_type == 'gcn':
-                graph_summary, _ = self._apply_gcn(graph_batch, task_features.size(1))
-            else:
-                graph_summary, _ = self._apply_gat(graph_batch, task_features.size(1))
-            graph_summary = graph_summary.squeeze(1)             # [batch, 2]
-            combined = torch.cat([server_features, graph_summary], dim=-1)  # [batch, server_dim+2]
-            out = self.fnn1(combined)                            # [batch, 64]
-            context = self.fnn_out(out)                          # [batch, hidden_dim*2]
+            apply_gnn = self._apply_gcn if self.encoder_type == 'gcn' else self._apply_gat
+            encoded_tasks, gnn_mask = apply_gnn(graph_batch, task_features.size(1))
 
-            # Decoder only uses context; encoded_tasks must be shape-compatible
-            # RC#2: Broadcast context to every node position so decoder attention has
-            # meaningful content instead of all-zeros. Every node gets the graph-level
-            # summary; per-node differentiation is handled by the decoder's attention
-            # over this uniform-but-non-zero key/value tensor.
-            encoded_tasks = context.unsqueeze(1).expand(
-                -1, task_features.size(1), -1
-            ).contiguous()
+            if node_mask is None:
+                node_mask = gnn_mask
+            valid = node_mask.unsqueeze(-1).float()
+            encoded_tasks = self.node_norm(encoded_tasks) * valid
+
+            # Mean readout over real nodes only (padding must not dilute the mean).
+            readout = (encoded_tasks * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+
+            combined = torch.cat([server_features, readout], dim=-1)
+            context = self.fnn_out(self.fnn1(combined))          # [batch, hidden_dim*2]
             return encoded_tasks, context
 
         embedded = self.task_embedding(task_features)
@@ -388,9 +372,15 @@ class PreferenceConditionedDecoder(nn.Module):
         # RC#13: Project full context [hidden_dim*2] → [hidden_dim] so both halves
         # of the bidirectional encoding initialise the decoder LSTM state.
         self.context_projection = nn.Linear(hidden_dim * 2, hidden_dim)
-        
-        # LSTM decoder
-        self.lstm_cell = nn.LSTMCell(hidden_dim * 3, hidden_dim)
+
+        # Embedding of the node currently being scheduled, indexed out of encoded_tasks.
+        # Without this the decoder has no idea WHICH node it is placing: every input it
+        # receives (graph, servers, preference) is constant across an episode, so it
+        # emitted identical logits at every step and placed the whole DAG on one server.
+        self.current_node_projection = nn.Linear(hidden_dim * 2, hidden_dim)
+
+        # LSTM decoder — input is [h_t, attn_context, pref, current_node]
+        self.lstm_cell = nn.LSTMCell(hidden_dim * 4, hidden_dim)
         
         # Multi-head attention
         self.attention = nn.MultiheadAttention(
@@ -401,60 +391,77 @@ class PreferenceConditionedDecoder(nn.Module):
         
         # Decision head with separate objective prediction
         self.decision_head = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_resources)
         )
-        
-    def forward(self, encoded_tasks, context, preference, num_steps, node_mask=None):
+
+    def forward(self, encoded_tasks, context, preference, num_steps,
+                node_mask=None, current_node_idx=None):
         """
-        Sequential decoding with preference conditioning
+        Sequential decoding with preference conditioning.
+
+        Args:
+            current_node_idx: [B] index of the node being scheduled this step. When None,
+                falls back to node 0 — only correct for single-node/independent tasks.
         """
         batch_size = encoded_tasks.size(0)
         key_padding_mask = None
         if node_mask is not None:
             key_padding_mask = ~node_mask.bool()
-        
+
         # Encode preference
         pref_encoded = self.preference_encoder(preference)
-        
+
+        # Pull out the embedding of the node actually being placed (pointer-style
+        # indexing, cf. Vinyals et al. 2015). This is what makes the policy a function
+        # of the current node rather than of the graph alone.
+        if current_node_idx is None:
+            current_node_idx = torch.zeros(batch_size, dtype=torch.long, device=encoded_tasks.device)
+        current_node_idx = current_node_idx.clamp(0, encoded_tasks.size(1) - 1)
+        cur_node = encoded_tasks[torch.arange(batch_size, device=encoded_tasks.device), current_node_idx]
+        cur_encoded = self.current_node_projection(cur_node)      # [B, hidden_dim]
+
         # Initialize LSTM state
         # RC#13: Use full context via projection (was discarding second half with [:hidden_dim])
         h_t = self.context_projection(context)  # [B, hidden_dim]
         c_t = torch.zeros_like(h_t)
-        
+
         action_logits_list = []
-        
+
         for step in range(num_steps):
-            # Attention query
-            query = torch.cat([h_t, pref_encoded], dim=-1).unsqueeze(1)
-            
+            # Attention query — conditioned on the current node so the decoder can look
+            # up that node's parents/children among the encoded nodes.
+            query = torch.cat([cur_encoded, pref_encoded], dim=-1).unsqueeze(1)
+
             attn_out, attn_weights = self.attention(
                 query, encoded_tasks, encoded_tasks, key_padding_mask=key_padding_mask
             )
-            
+
             attn_context = attn_out.squeeze(1)
-            
+
             # LSTM update
             lstm_input = torch.cat([
                 h_t,
                 attn_context[:, :self.hidden_dim],
-                pref_encoded
+                pref_encoded,
+                cur_encoded
             ], dim=-1)
-            
+
             h_t, c_t = self.lstm_cell(lstm_input, (h_t, c_t))
-            
+
             # Decision
             decision_input = torch.cat([
                 h_t,
                 attn_context[:, :self.hidden_dim],
-                pref_encoded
+                pref_encoded,
+                cur_encoded
             ], dim=-1)
-            
+
             logits = self.decision_head(decision_input)
             action_logits_list.append(logits)
-        
+
         action_logits = torch.stack(action_logits_list, dim=1)
         
         return action_logits
@@ -474,7 +481,8 @@ class MetaPolicyNetwork(nn.Module):
         encoder_type: str = 'lstm',
         num_gat_heads: int = 4,
         gat_hidden_dim: int = 16,
-        gat_add_self_loops: bool = True
+        gat_add_self_loops: bool = True,
+        gnn_hidden_dim: int = 16
     ):
         super(MetaPolicyNetwork, self).__init__()
 
@@ -485,7 +493,8 @@ class MetaPolicyNetwork(nn.Module):
             server_feature_dim=server_feature_dim,
             num_gat_heads=num_gat_heads,
             gat_hidden_dim=gat_hidden_dim,
-            gat_add_self_loops=gat_add_self_loops
+            gat_add_self_loops=gat_add_self_loops,
+            gnn_hidden_dim=gnn_hidden_dim
         )
         
         self.decoder = PreferenceConditionedDecoder(
@@ -510,10 +519,14 @@ class MetaPolicyNetwork(nn.Module):
         num_decisions: int = 1,
         adjacency=None,
         node_mask=None,
-        graph_batch=None
+        graph_batch=None,
+        current_node_idx=None
     ):
         """
         Forward pass
+
+        Args:
+            current_node_idx: [B] LongTensor — which node each batch element is placing.
         """
         encoded_tasks, context = self.encoder(
             task_features,
@@ -522,13 +535,14 @@ class MetaPolicyNetwork(nn.Module):
             graph_batch=graph_batch,
             server_features=server_features
         )
-        
+
         server_encoded = self.server_encoder(server_features)
         combined_context = context + server_encoded
         action_logits = self.decoder(
-            encoded_tasks, combined_context, preference, num_decisions, node_mask=node_mask
+            encoded_tasks, combined_context, preference, num_decisions,
+            node_mask=node_mask, current_node_idx=current_node_idx
         )
-        
+
         return action_logits
 
 class MultiObjectiveValueNetwork(nn.Module):
@@ -690,7 +704,42 @@ class LowerLayerAgent:
         
         # Local optimizer (SGD for fast adaptation as per MAML)
         self.inner_lr = config.get('inner_lr', 0.01)
-        
+
+        # PPO surrogate clipping. The inner loop takes `inner_steps` gradient steps on a
+        # single batch collected under the meta-policy, so after the first step the data
+        # is off-policy. A clipped importance ratio bounds how far each step can move the
+        # policy on stale data; without it those steps are uncorrected vanilla PG.
+        self.clip_eps = config.get('ppo_clip_eps', 0.2)
+        self.value_coef = config.get('value_loss_coef', 0.5)
+        self.entropy_coef = config.get('entropy_coef', 0.01)
+
+    def _ppo_policy_loss(
+        self,
+        log_probs: torch.Tensor,
+        old_log_probs: torch.Tensor,
+        advantages: torch.Tensor
+    ) -> torch.Tensor:
+        """Clipped surrogate objective (Schulman et al., 2017)."""
+        ratio = torch.exp(log_probs - old_log_probs)
+        surr_unclipped = ratio * advantages
+        surr_clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages
+        return -torch.min(surr_unclipped, surr_clipped).mean()
+
+    @staticmethod
+    def _old_log_probs(batch: List[Dict], device: torch.device) -> torch.Tensor:
+        """
+        Behaviour-policy log-probs for the batch.
+
+        Falls back to the current policy's log-probs (ratio == 1, i.e. plain policy
+        gradient) for experiences collected before `old_log_prob` was recorded, so
+        older checkpoints and replay buffers keep working.
+        """
+        if 'old_log_prob' not in batch[0]:
+            return None
+        return torch.FloatTensor(
+            np.array([exp['old_log_prob'] for exp in batch], dtype=np.float32)
+        ).to(device)
+
         # Hypervolume tracking
         self.hv_threshold = config.get('hypervolume_threshold', 0.5)
         self.hv_window = config.get('moving_average_window', 50)
@@ -734,7 +783,11 @@ class LowerLayerAgent:
             np.array([exp['server_features'] for exp in batch], dtype=np.float32)
         ).to(self.device)
 
-        return task_features, server_features, adjacency, node_mask, graph_batch
+        current_node_idx = torch.LongTensor(
+            [int(exp.get('current_node_idx', 0)) for exp in batch]
+        ).to(self.device)
+
+        return task_features, server_features, adjacency, node_mask, graph_batch, current_node_idx
 
     def _forward_with_params(
         self,
@@ -745,7 +798,8 @@ class LowerLayerAgent:
         num_decisions: int = 1,
         adjacency=None,
         node_mask=None,
-        graph_batch=None
+        graph_batch=None,
+        current_node_idx=None
     ):
         """
         Forward pass using specific parameters (for functional gradient computation)
@@ -761,7 +815,8 @@ class LowerLayerAgent:
                 'num_decisions': num_decisions,
                 'adjacency': adjacency,
                 'node_mask': node_mask,
-                'graph_batch': graph_batch
+                'graph_batch': graph_batch,
+                'current_node_idx': current_node_idx
             }
         )
 
@@ -842,12 +897,13 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
-            
+        (task_features, server_features, adjacency, node_mask,
+         graph_batch, current_node_idx) = self._prepare_policy_batch(batch)
+
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-            
+
         # Forward pass with adapted parameters
         action_logits = self._forward_with_params(
             params_dict,
@@ -857,7 +913,8 @@ class LowerLayerAgent:
             num_decisions=1,
             adjacency=adjacency,
             node_mask=node_mask,
-            graph_batch=graph_batch
+            graph_batch=graph_batch,
+            current_node_idx=current_node_idx
         )
         
         # Policy loss
@@ -881,14 +938,18 @@ class LowerLayerAgent:
         adv_std = weighted_advantages.std() + 1e-8
         adv_mean = weighted_advantages.mean()
         weighted_advantages = (weighted_advantages - adv_mean) / adv_std
-        
+
         # Combined loss
         # NOTE: .mean(dim=-1) not .sum(dim=-1) for value_loss.
         # mo_returns / values are shape (batch, 2). .sum() over dim=-1 multiplies
         # the MSE by the number of objectives, ballooning value_loss to dominate
         # the gradient and causing divergence. .mean() keeps both objectives
         # equally weighted and in the same scale as policy_loss.
-        policy_loss  = -(log_probs * weighted_advantages).mean()
+        old_log_probs = self._old_log_probs(batch, self.device)
+        if old_log_probs is None:
+            policy_loss = -(log_probs * weighted_advantages).mean()
+        else:
+            policy_loss = self._ppo_policy_loss(log_probs, old_log_probs, weighted_advantages)
         value_loss   = ((mo_returns - values) ** 2).mean(dim=-1).mean()
         entropy_loss = -entropy.mean()
 
@@ -906,12 +967,9 @@ class LowerLayerAgent:
                 f"  entropy={entropy_loss.item():.4f}"
             )
 
-        total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
-        
+        total_loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
+
         return total_loss
-
-
-
 
     def _compute_loss(self, batch: List[Dict]) -> torch.Tensor:
         """
@@ -919,12 +977,13 @@ class LowerLayerAgent:
         """
         # Extract batch data
         states = torch.FloatTensor(np.array([exp['state'] for exp in batch])).to(self.device)
-        task_features, server_features, adjacency, node_mask, graph_batch = self._prepare_policy_batch(batch)
-            
+        (task_features, server_features, adjacency, node_mask,
+         graph_batch, current_node_idx) = self._prepare_policy_batch(batch)
+
         actions = torch.LongTensor([exp['action'] for exp in batch]).to(self.device)
         preferences = torch.FloatTensor(np.array([exp['preference'] for exp in batch])).to(self.device)
         mo_returns = torch.FloatTensor(np.array([exp['mo_return'] for exp in batch])).to(self.device)
-            
+
         # Forward pass
         action_logits = self.meta_policy(
             task_features,
@@ -933,7 +992,8 @@ class LowerLayerAgent:
             num_decisions=1,
             adjacency=adjacency,
             node_mask=node_mask,
-            graph_batch=graph_batch
+            graph_batch=graph_batch,
+            current_node_idx=current_node_idx
         )
         
         # Policy loss
@@ -959,11 +1019,15 @@ class LowerLayerAgent:
         weighted_advantages = (weighted_advantages - adv_mean) / adv_std
 
         # Combined loss — same .mean(dim=-1) fix as _compute_loss_with_params
-        policy_loss  = -(log_probs * weighted_advantages).mean()
+        old_log_probs = self._old_log_probs(batch, self.device)
+        if old_log_probs is None:
+            policy_loss = -(log_probs * weighted_advantages).mean()
+        else:
+            policy_loss = self._ppo_policy_loss(log_probs, old_log_probs, weighted_advantages)
         value_loss   = ((mo_returns - values) ** 2).mean(dim=-1).mean()
         entropy_loss = -entropy.mean()
 
-        total_loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+        total_loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * entropy_loss
 
         return total_loss
     
@@ -1228,25 +1292,44 @@ class TAMPOFramework:
     SIMPLIFIED TAM-PO Framework - focus on fast learning
     """
     
-    def __init__(self, env, config: Dict, model_path: Optional[str] = None):
+    def __init__(self, env, config: Dict, model_path: Optional[str] = None,
+                 seed: Optional[int] = None):
         self.env = env
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         print(f"🔧 Using device: {self.device}")
-        
-        # Network dimensions
-        task_feature_dim = 6
+
+        # Seed BEFORE building the networks. Weight initialisation consumes the torch RNG,
+        # so it must be seeded here or the initial weights differ from run to run (that was
+        # a real bug: seeding inside train() left W0 dependent on prior global RNG state).
+        # torch init does not touch the numpy RNG, so after this call every encoder — GCN,
+        # GAT, LSTM — enters training with an identical numpy stream and therefore faces the
+        # identical sequence of graphs, preferences and channel conditions, even though
+        # their weight inits (torch) legitimately differ. On resume, load() overwrites the
+        # weights and captures the saved RNG for train() to restore, so this seed is moot.
+        self._seed = seed if seed is not None else config.get('seed', None)
+        if self._seed is not None:
+            from utils.seeding import set_seed
+            set_seed(self._seed, deterministic_torch=config.get('deterministic_torch', False))
+
+        # Network dimensions — read the width from the env rather than hardcoding it,
+        # so adding a node feature cannot silently desync the encoder's input layer.
+        task_feature_dim = getattr(env, 'task_feature_dim', 9)
         server_feature_dim = 20
         num_resources = env.action_space.n
         hidden_dim = config.get('hidden_dim', config.get('hidden_dims', [128])[0])
         encoder_type = config.get('encoder_type', 'lstm')
         self.encoder_type = encoder_type
 
+        # Per-episode action histogram, for the training-time policy-collapse diagnostic
+        self._action_counts: Dict[int, int] = {}
+
         # GAT-specific config (ignored for non-GAT encoders)
         num_gat_heads = config.get('num_gat_heads', 4)
         gat_hidden_dim = config.get('gat_hidden_dim', 16)
         gat_add_self_loops = config.get('gat_add_self_loops', True)
+        gnn_hidden_dim = config.get('gnn_hidden_dim', 16)
 
         # Initialize networks
         meta_policy = MetaPolicyNetwork(
@@ -1257,7 +1340,8 @@ class TAMPOFramework:
             encoder_type=encoder_type,
             num_gat_heads=num_gat_heads,
             gat_hidden_dim=gat_hidden_dim,
-            gat_add_self_loops=gat_add_self_loops
+            gat_add_self_loops=gat_add_self_loops,
+            gnn_hidden_dim=gnn_hidden_dim
         )
         
         value_network = MultiObjectiveValueNetwork(
@@ -1289,10 +1373,18 @@ class TAMPOFramework:
             'iterations': 0,
             'best_loss': float('inf')
         }
-        
+
+        # RNG state captured from a resumed checkpoint, consumed once at the start of the
+        # next train() call. None on a fresh model. This is what lets a run split across
+        # sessions reproduce a single continuous run bit-for-bit: the exact position in
+        # the numpy/python/torch RNG streams is restored, not merely re-seeded.
+        self._checkpoint_rng = None
+        self._resumed = False
+
         # Automatic checkpoint loading
         if model_path and os.path.exists(model_path):
             self.load(model_path)
+            self._resumed = True
             print(f"✓ Resuming from checkpoint: {model_path}")
         else:
             print("✓ Initialized new TAM-PO model with neutral decoder initialization")
@@ -1310,29 +1402,69 @@ class TAMPOFramework:
                 with torch.no_grad():
                     param.zero_()
 
-    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = None):
+    def train(self, num_iterations: int, meta_batch_size: int, checkpoint_path: str = None,
+              time_budget_s: float = None):
         """
-        Main training loop with proper MAML meta-learning and checkpointing
+        Main training loop with proper MAML meta-learning and checkpointing.
+
+        Args:
+            time_budget_s: Optional wall-clock budget. Training stops cleanly at the first
+                iteration boundary after the budget is exhausted, saves a checkpoint, and
+                returns. Intended for Colab free-tier sessions, which are killed at ~4h —
+                without this the run dies mid-iteration and loses everything since the last
+                10-iteration autosave.
+
+        Seeding is handled in __init__ (before weight init). Here we only RESTORE the RNG
+        stream when resuming, so a run split across sessions is bit-identical to one
+        continuous run — iterations N..M draw exactly the tasks they would have drawn had
+        the run never stopped.
         """
         if checkpoint_path is None:
             checkpoint_path = f"models/tampo_{self.encoder_type}_checkpoint.pth"
+
+        episodes_per_task = int(self.config.get('episodes_per_task', 5))
+
+        # ── RNG: restore an in-flight stream when resuming ────────────────────────────
+        if self._checkpoint_rng is not None:
+            random.setstate(self._checkpoint_rng['python'])
+            np.random.set_state(self._checkpoint_rng['numpy'])
+            torch.set_rng_state(self._checkpoint_rng['torch'])
+            if self._checkpoint_rng.get('torch_cuda') is not None and torch.cuda.is_available():
+                try:
+                    torch.cuda.set_rng_state_all(self._checkpoint_rng['torch_cuda'])
+                except Exception:
+                    pass  # resumed on a different GPU count; CPU/numpy streams still exact
+            self._checkpoint_rng = None   # consume once
+            rng_mode = "restored from checkpoint (exact continuation)"
+        elif self._seed is not None:
+            rng_mode = f"fresh, seeded {self._seed} at construction"
+        else:
+            rng_mode = "unseeded (not reproducible)"
+
         print(f"\n{'='*60}")
         print(f"🚀 TAM-PO Meta-Training")
         print(f"{'='*60}")
         print(f"  Iterations: {num_iterations}")
         print(f"  Meta-batch size: {meta_batch_size}")
+        print(f"  Episodes per task: {episodes_per_task}")
         print(f"  Starting from iteration: {self.training_history['iterations']}")
         print(f"  Inner LR: {self.config.get('inner_lr', 0.01)}")
         print(f"  Meta LR: {self.config.get('meta_learning_rate', 1e-4)}")
+        print(f"  RNG: {rng_mode}")
+        if time_budget_s:
+            print(f"  Wall-clock budget: {time_budget_s / 3600:.2f} h (stops cleanly, checkpoint saved)")
         print(f"{'='*60}\n")
+
+        train_start = time.time()
+        stopped_early = False
 
         cudnn_enabled = not (self.encoder_type in {'lstm', 'both'} and self.device.type == 'cuda')
         if not cudnn_enabled:
             print("  CuDNN disabled for TAMPO LSTM-style meta-training to support second-order gradients.")
         
         with torch.backends.cudnn.flags(enabled=cudnn_enabled):
-            # Create checkpoint directory
-            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+            # Create checkpoint directory (dirname may be '' for a bare filename)
+            os.makedirs(os.path.dirname(checkpoint_path) or '.', exist_ok=True)
             
             start_iter = self.training_history['iterations']
             
@@ -1346,20 +1478,24 @@ class TAMPOFramework:
                     task_ids = list(range(min(meta_batch_size, 10)))
                 
                 task_batch = []
-                
+                self._action_counts = {}   # reset the per-iteration action histogram
+
                 # Collect experiences (silent mode)
                 for task_id in task_ids:
                     if hasattr(self.env, 'set_task'):
                         self.env.set_task(task_id)
-                    
-                    train_exp, test_exp = self._collect_task_experiences(task_id, num_episodes=5)
-                    
+
+                    train_exp, test_exp = self._collect_task_experiences(
+                        task_id, num_episodes=episodes_per_task
+                    )
+
                     task_batch.append({
                         'task_id': task_id,
                         'train_experiences': train_exp,
                         'test_experiences': test_exp
                     })
-                
+
+                action_report = self._format_action_distribution(self._action_counts)
                 meta_loss = self.meta_learner.meta_update(task_batch)
                 
                 # Store loss
@@ -1375,33 +1511,87 @@ class TAMPOFramework:
                 # Progress reporting every 5 iterations
                 if (iteration + 1) % 5 == 0 or iteration == 0:
                     avg_loss_10 = np.mean(self.training_history['losses'][-10:])
+                    elapsed = time.time() - train_start
+                    sec_per_iter = elapsed / (iteration + 1)
                     print(f"  Iter {current_iter + 1:3d}/{start_iter + num_iterations} | "
                           f"Loss: {meta_loss:.4f} | "
                           f"Avg(10): {avg_loss_10:.4f} | "
-                          f"Best: {self.training_history['best_loss']:.4f}")
-                
+                          f"Best: {self.training_history['best_loss']:.4f} | "
+                          f"{sec_per_iter:.1f}s/it")
+                    # Which servers is the policy actually choosing?  A distribution that
+                    # collapses onto one action means the policy has degenerated — the
+                    # single most useful signal that training has gone wrong.
+                    print(f"  [actions] {action_report}")
+
                 # Save checkpoint every 10 iterations
                 if (iteration + 1) % 10 == 0:
                     self._save_checkpoint(checkpoint_path)
-            
+
+                # Wall-clock budget: stop at an iteration boundary with a saved checkpoint
+                # rather than being killed mid-iteration by the Colab session limit.
+                if time_budget_s and (time.time() - train_start) >= time_budget_s:
+                    self._save_checkpoint(checkpoint_path)
+                    stopped_early = True
+                    done = iteration + 1
+                    print(f"\n⏱  Wall-clock budget reached after {done}/{num_iterations} "
+                          f"iterations this session ({(time.time() - train_start) / 3600:.2f} h).")
+                    print(f"   Checkpoint saved. Re-run the same cell to continue from "
+                          f"iteration {self.training_history['iterations']}.")
+                    break
+
             # Final save
             self._save_checkpoint(checkpoint_path)
 
-        print(f"\n✓ Training complete!")
+        elapsed = time.time() - train_start
+        print(f"\n✓ Training {'stopped on budget' if stopped_early else 'complete'}!")
         print(f"  Total iterations: {self.training_history['iterations']}")
+        print(f"  This session: {elapsed / 3600:.2f} h "
+              f"({elapsed / max(iteration + 1, 1):.1f}s per iteration)")
         print(f"  Final loss: {meta_loss:.4f}")
         print(f"  Best loss: {self.training_history['best_loss']:.4f}")
         print(f"  Model saved to: {checkpoint_path}")
     
     def _save_checkpoint(self, path: str):
-        """Save checkpoint with training history"""
-        torch.save({
+        """
+        Save checkpoint with training history AND full RNG state.
+
+        The RNG snapshot (python / numpy / torch, plus CUDA if present) is what makes a
+        run resumable *exactly*. On reload, train() restores these instead of re-seeding,
+        so iterations 251..500 of a resumed run draw the identical task sequence,
+        preferences and channel gains they would have drawn in one continuous 500-iteration
+        run. Writing is atomic (temp file + os.replace) so a session killed mid-write
+        cannot leave a truncated, unloadable checkpoint.
+        """
+        rng_state = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state(),
+            'torch_cuda': (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            ),
+        }
+        payload = {
             'meta_policy': self.meta_learner.meta_policy.state_dict(),
             'value_network': self.meta_learner.value_network.state_dict(),
             'meta_optimizer': self.meta_learner.meta_optimizer.state_dict(),
             'config': self.config,
-            'training_history': self.training_history
-        }, path)
+            'training_history': self.training_history,
+            'rng_state': rng_state,
+        }
+        tmp = f"{path}.tmp"
+        try:
+            torch.save(payload, tmp)
+            os.replace(tmp, path)   # atomic on POSIX; never a half-written checkpoint
+        except OSError:
+            # Google Drive's FUSE mount can reject cross-name rename; fall back to a
+            # direct write. Slightly less crash-safe, but Drive is the durable copy and
+            # the local ./models autosave still provides atomicity when both are used.
+            torch.save(payload, path)
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
     
     def _collect_task_experiences(self, task_id: int, num_episodes: int = 10):
         """Collect MORE experiences for better learning"""
@@ -1421,38 +1611,39 @@ class TAMPOFramework:
                 task_features = self._extract_task_features(state)
                 server_features = self._extract_server_features(state)
                 adj_matrix = self._extract_adjacency_matrix()
-                
-                action = self._select_action(
+                current_node_idx = self._current_node_idx()
+
+                action, old_log_prob = self._select_action(
                     task_features,
                     server_features,
                     preference,
                     adj_matrix,
-                    deterministic=False
+                    deterministic=False,
+                    return_log_prob=True,
+                    current_node_idx=current_node_idx
                 )
-                
+
                 next_state, reward, done, info = self.env.step(action)
-                
-                # RC#1 + RC#4: Store raw delay/energy and node_cycles so the
-                # post-episode backward pass can compute signed discounted returns.
-                node_id = self.env.topo_order[step_count] if (self.env._is_dag_task() and step_count < len(self.env.topo_order)) else 0
-                node_cycles = 0.0
-                if self.env._is_dag_task() and self.env.current_task is not None:
-                    tasks_list = self.env.current_task.get('tasks', [])
-                    if node_id < len(tasks_list):
-                        node_cycles = float(tasks_list[node_id].get('cycles', 1e9))
-                
+                self._action_counts[action] = self._action_counts.get(action, 0) + 1
+
                 exp = {
                     'state': state,
                     'task_features': task_features,
                     'server_features': server_features,
                     'adj_matrix': adj_matrix,
+                    'current_node_idx': current_node_idx,
                     'action': action,
                     'reward': reward,
                     'preference': preference,
-                    # Temporary fields: removed in backward return-computation pass below
-                    'raw_delay': float(info.get('delay', 0)),
-                    'raw_energy': float(info.get('energy', 0)),
-                    'node_cycles': node_cycles,
+                    # Behaviour-policy log-prob, for the PPO importance ratio.  The inner
+                    # loop takes several gradient steps on this batch, so from step 2
+                    # onward the data is off-policy w.r.t. the adapted params.
+                    'old_log_prob': old_log_prob,
+                    # Per-objective step rewards straight from the env.  r_delay already
+                    # carries the congestion + communication penalties; both are clipped
+                    # to [-1, 1].  Consumed by the backward pass below.
+                    'r_delay': float(info.get('r_delay', 0.0)),
+                    'r_energy': float(info.get('r_energy', 0.0)),
                     # Placeholder; will be overwritten by backward pass
                     'mo_return': np.zeros(2, dtype=np.float32),
                     'next_state': next_state,
@@ -1465,12 +1656,17 @@ class TAMPOFramework:
 
         # ── RC#1 + RC#4: Compute per-objective discounted returns (backward pass) ──────
         # mo_return must be a BENEFIT (higher = better), not a raw physical cost.
+        #
+        # The per-step signals are the env's own reward components (info['r_delay'],
+        # info['r_energy']).  Deriving them here from raw delay/energy instead — as this
+        # used to — silently discards the congestion and communication penalties, so the
+        # agent was never taught to avoid queueing even though makespan, the metric it is
+        # scored on, is almost entirely queue-driven.
+        #
         # IMPORTANT: G MUST reset between episodes. Without resetting, returns from
         # episode N bleed backwards into episode N-1, inflating returns by up to
         # num_episodes * correct_return and making the value network impossible to train.
         gamma = self.config.get('gamma', 0.99)
-        env_local_freq = self.env.local_freq
-        env_kappa = self.env.kappa
 
         # Split experiences back into per-episode groups by detecting done=True
         episodes: list = []
@@ -1487,13 +1683,8 @@ class TAMPOFramework:
         for ep_exps in episodes:
             G_delay, G_energy = 0.0, 0.0          # reset per episode
             for exp in reversed(ep_exps):
-                cycles = exp.pop('node_cycles', 1e9)
-                local_delay  = cycles / max(env_local_freq, 1e-9)
-                local_energy = env_kappa * cycles * (env_local_freq ** 2)
-                step_d_imp = (local_delay  - exp.pop('raw_delay',  0)) / max(local_delay,  1e-9)
-                step_e_imp = (local_energy - exp.pop('raw_energy', 0)) / max(local_energy, 1e-9)
-                G_delay  = step_d_imp + gamma * G_delay
-                G_energy = step_e_imp + gamma * G_energy
+                G_delay  = exp.pop('r_delay')  + gamma * G_delay
+                G_energy = exp.pop('r_energy') + gamma * G_energy
                 exp['mo_return'] = np.array([G_delay, G_energy], dtype=np.float32)
 
         # Flatten all episodes back into a single list for the train/test split
@@ -1514,6 +1705,28 @@ class TAMPOFramework:
         test_experiences  = all_experiences[split:]
         return train_experiences, test_experiences
     
+    def _format_action_distribution(self, counts: Dict[int, int]) -> str:
+        """
+        Render an action histogram plus its normalised entropy.
+
+        entropy = 1.00 → the policy spreads evenly over all servers.
+        entropy = 0.00 → the policy has collapsed onto a single server, which is the
+        degenerate solution this framework is prone to. Watch this number.
+        """
+        total = sum(counts.values())
+        if total == 0:
+            return "no actions recorded"
+
+        n = self.env.action_space.n
+        probs = np.array([counts.get(a, 0) / total for a in range(n)])
+        nz = probs[probs > 0]
+        entropy = float(-(nz * np.log(nz)).sum() / np.log(n)) if n > 1 else 0.0
+
+        parts = " ".join(
+            f"{action_name(a)}={probs[a] * 100:4.1f}%" for a in range(n)
+        )
+        return f"{parts} | entropy={entropy:.2f} (0=collapsed, 1=uniform) | n={total}"
+
     def _sample_preference(self) -> np.ndarray:
         """Sample preference vector"""
         w_delay = np.random.uniform(0.2, 0.8)
@@ -1576,45 +1789,85 @@ class TAMPOFramework:
         server_features,
         preference,
         adj_matrix=None,
-        deterministic: bool = False
+        deterministic: bool = False,
+        return_log_prob: bool = False,
+        current_node_idx: int = None
     ):
-        """Select a graph-conditioned offloading action."""
-        with torch.no_grad():
-            task_tensor = torch.FloatTensor(task_features).unsqueeze(0).to(self.device)
-            server_tensor = torch.FloatTensor(server_features).unsqueeze(0).to(self.device)
-            pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
-            node_mask = torch.ones((1, task_features.shape[0]), dtype=torch.bool, device=self.device)
-            
-            if adj_matrix is None:
-                adj_matrix = np.eye(task_features.shape[0], dtype=np.float32)
-            adj_tensor = torch.FloatTensor(adj_matrix).unsqueeze(0).to(self.device)
-            graph_batch = _build_pyg_batch(
-                [np.asarray(task_features, dtype=np.float32)],
-                [np.asarray(adj_matrix, dtype=np.float32)]
-            ).to(self.device)
-            
-            logits = self.agents[0].meta_policy(
-                task_tensor,
-                server_tensor,
-                pref_tensor,
-                num_decisions=1,
-                adjacency=adj_tensor,
-                node_mask=node_mask,
-                graph_batch=graph_batch
-            )
-            
-            probs = torch.softmax(logits[:, 0, :], dim=-1)
-            
-            if deterministic:
-                # RC#11: Greedy argmax only during evaluation — not during training.
-                action = torch.argmax(probs, dim=-1).item()
-            else:
-                # RC#11: Use Categorical sampling for training exploration.
-                # This naturally weights all actions by their policy probability,
-                # includes local (action 0), and avoids the biased epsilon-greedy.
-                action = Categorical(probs).sample().item()
-        
-        return action
+        """
+        Select a graph-conditioned offloading action.
+
+        Returns the action, or `(action, log_prob)` when `return_log_prob=True`.
+        The log-prob is the behaviour policy's, needed for the PPO importance ratio
+        during the MAML inner loop.
+
+        The policy always runs in eval() mode here. Dropout during action selection
+        would (a) make `deterministic=True` non-deterministic — benchmark actions were
+        argmaxes over dropout-corrupted logits — and (b) break the PPO ratio, since
+        `old_log_prob` would come from a different dropout mask than the one the loss
+        recomputes under. Exploration comes from Categorical sampling, not from dropout.
+        """
+        policy = self.agents[0].meta_policy
+        was_training = policy.training
+        policy.eval()
+        try:
+            with torch.no_grad():
+                task_tensor = torch.FloatTensor(task_features).unsqueeze(0).to(self.device)
+                server_tensor = torch.FloatTensor(server_features).unsqueeze(0).to(self.device)
+                pref_tensor = torch.FloatTensor(preference).unsqueeze(0).to(self.device)
+                node_mask = torch.ones((1, task_features.shape[0]), dtype=torch.bool, device=self.device)
+
+                if adj_matrix is None:
+                    adj_matrix = np.eye(task_features.shape[0], dtype=np.float32)
+                adj_tensor = torch.FloatTensor(adj_matrix).unsqueeze(0).to(self.device)
+                graph_batch = _build_pyg_batch(
+                    [np.asarray(task_features, dtype=np.float32)],
+                    [np.asarray(adj_matrix, dtype=np.float32)]
+                ).to(self.device)
+
+                if current_node_idx is None:
+                    current_node_idx = self._current_node_idx()
+                cur_idx = torch.LongTensor([current_node_idx]).to(self.device)
+
+                logits = policy(
+                    task_tensor,
+                    server_tensor,
+                    pref_tensor,
+                    num_decisions=1,
+                    adjacency=adj_tensor,
+                    node_mask=node_mask,
+                    graph_batch=graph_batch,
+                    current_node_idx=cur_idx
+                )
+
+                probs = torch.softmax(logits[:, 0, :], dim=-1)
+
+                if deterministic:
+                    # RC#11: Greedy argmax only during evaluation — not during training.
+                    action = torch.argmax(probs, dim=-1).item()
+                else:
+                    # RC#11: Use Categorical sampling for training exploration.
+                    # This naturally weights all actions by their policy probability,
+                    # includes local (action 0), and avoids the biased epsilon-greedy.
+                    action = Categorical(probs).sample().item()
+
+                if return_log_prob:
+                    log_prob = float(torch.log(probs[0, action].clamp_min(1e-8)).item())
+                    return action, log_prob
+
+            return action
+        finally:
+            if was_training:
+                policy.train()
+
+    def _current_node_idx(self) -> int:
+        """Index (into the task-feature matrix) of the node the env is about to schedule."""
+        env = self.env
+        if getattr(env, 'topo_order', None) is None:
+            return 0
+        idx = getattr(env, 'current_node_idx', 0)
+        if idx >= len(env.topo_order):
+            return 0
+        return int(env.topo_order[idx])
     
     def evaluate(self, num_episodes: int = 20):
         """Evaluate framework"""
@@ -1670,25 +1923,41 @@ class TAMPOFramework:
         return results
     
     def save(self, path: str):
-        """Save model"""
-        torch.save({
-            'meta_policy': self.meta_learner.meta_policy.state_dict(),
-            'value_network': self.meta_learner.value_network.state_dict(),
-            'meta_optimizer': self.meta_learner.meta_optimizer.state_dict(),
-            'config': self.config,
-            'training_history': self.training_history
-        }, path)
+        """
+        Save model. Delegates to _save_checkpoint so the RNG state is included — a plain
+        torch.save here would silently drop it and break exact resume, since the notebook
+        calls save() at the end of every session.
+        """
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        self._save_checkpoint(path)
         print(f"✓ Model saved to {path}")
-    
+
     def load(self, path: str):
-        """Load model"""
+        """Load model, including the RNG snapshot (captured, applied later by train())."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.meta_learner.meta_policy.load_state_dict(checkpoint['meta_policy'])
+        try:
+            self.meta_learner.meta_policy.load_state_dict(checkpoint['meta_policy'])
+        except RuntimeError as err:
+            raise RuntimeError(
+                f"Checkpoint '{path}' is incompatible with the current network.\n"
+                f"The 2026-07-10 encoder overhaul changed the node feature width (6 -> 9) "
+                f"and made the GNN emit per-node embeddings instead of a pooled scalar, so "
+                f"pre-overhaul checkpoints cannot be loaded. Delete models/*.pth and retrain.\n"
+                f"Original error: {err}"
+            ) from err
         self.meta_learner.value_network.load_state_dict(checkpoint['value_network'])
         self.meta_learner.meta_optimizer.load_state_dict(checkpoint['meta_optimizer'])
-        
+
         # Load training history if available
         if 'training_history' in checkpoint:
             self.training_history = checkpoint['training_history']
-        
-        print(f"✓ Model loaded from {path}")
+
+        # Capture (do NOT apply) the RNG snapshot. Applying it here would be undone by any
+        # RNG draw between construction and the training loop; train() applies it at the
+        # exact right moment. Older checkpoints without it fall back to seed-based init.
+        self._checkpoint_rng = checkpoint.get('rng_state', None)
+        if self._checkpoint_rng is None:
+            print("  ⚠ Checkpoint has no RNG state (pre-2026-07-11). Resume is approximate: "
+                  "weights continue, but the task stream restarts from the seed.")
+
+        print(f"✓ Model loaded from {path}  (iteration {self.training_history['iterations']})")

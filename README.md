@@ -22,8 +22,12 @@ Most standard offloading environments treat tasks as independent or evaluate the
 Because standard DRL agents tend to collapse into "lazy" local minimum policies (e.g., exclusively offloading to the Cloud), the reward system applies distinct pressures to force the agent to balance trade-offs. The total reward combines:
 
 1.  🚀 **Computation Improvement (The Carrot):** The environment calculates how much faster a task runs on the selected server compared to the baseline of running it locally on the mobile device. 
-2.  🚦 **Server Congestion Penalty (The Stick):** If an agent repeatedly chooses the same high-powered server (e.g., the Cloud), it is aggressively penalized based on the current length of that server's queue. This forces the agent to dynamically distribute load across Edge and Local devices.
-3.  📡 **Communication Penalty (The Stick):** If two tightly coupled tasks (a parent and its child) are scheduled on different machines, the agent receives a strict penalty corresponding to the data transmission overhead. This encourages algorithms to group dependent tasks together logically.
+2.  🚦 **Server Congestion Penalty (The Stick):** If an agent repeatedly chooses the same high-powered server (e.g., the Cloud), it is penalized by how long the task actually sat in that server's queue. This forces the agent to dynamically distribute load across Edge and Local devices.
+3.  📡 **Communication Penalty (The Stick):** If two tightly coupled tasks (a parent and its child) are scheduled on different machines, the agent is penalized by the transmission time actually incurred. This encourages algorithms to group dependent tasks together logically.
+
+Both penalties are expressed as a **relative overhead**, `cost / (cost + local_delay)` ∈ [0, 1) — dimensionless, smooth, and never fully saturated, so the term keeps a usable gradient at any congestion level and needs no retuning when task sizes or clock speeds change.
+
+`step()` exposes the two objective components separately as `info['r_delay']` and `info['r_energy']`, each clipped to [-1, 1]. **Multi-objective learners must discount these**, not re-derive improvements from raw delay/energy — doing the latter silently discards both penalties. See `dev_logs/reward_signal_and_determinism_overhaul.md`.
 
 #### 3. User Preference Alignment (MORL)
 As demonstrated in the TAMPO framework, the reward system dynamically adapts to user priorities via a **Preference Vector** `[w_delay, w_energy]`.
@@ -313,9 +317,123 @@ See [Papers referred.md](Papers%20referred.md) for all full citations.
 
 ---
 
+## Graph Encoder & Observability Overhaul (2026-07-10)
+
+> 📖 **Reading the output:** see **[docs/READING_RESULTS.md](docs/READING_RESULTS.md)** — written in two layers, plain-English first, technical second.
+
+Measured with dropout disabled, all three encoders emitted **identical logits at every node** of a DAG (`max|logit - logit_step0| = 0.00e+00`). Each one picked a single server and sent the whole graph there. Every GCN/GAT/LSTM comparison produced before this fix is void. Full analysis in `dev_logs/graph_encoder_and_observability_overhaul.md`.
+
+| Area | What Changed | Why It Matters |
+|---|---|---|
+| `base_offloading_env.py` | Node features `6 → 9`: `is_current`, `is_scheduled`, `assigned_server` | The policy had no way to know **which node** it was scheduling. (The critic did — it reads the flat obs.) |
+| `base_offloading_env.py` | `get_server_features()` reports real queue times | `server_loads` was zeroed in `reset()` and **never written again**; `_execute_offloading` advances `server_available`, a different array. The agent was blind to congestion. |
+| `tampo.py` | GNN emits per-node embeddings; no more `.mean()` to a scalar | The whole graph was crushed to **2 floats**, then broadcast to every node slot — so decoder attention ran over N identical keys. |
+| `tampo.py` | Decoder indexes the current node's embedding (pointer-style) | Makes the policy a function of the node being placed, not just of the graph. |
+| `tampo.py` | `_select_action` forces `eval()` | `.eval()` was only called inside the MAML inner loop, so "deterministic" benchmark actions were argmaxes over **dropout-corrupted** logits. |
+| `tampo.py`, `common_evaluator.py`, `benchmark.py` | Action histograms, entropy, per-episode traces | A degenerate all-cloud policy posts a respectable makespan. None of this was visible before. |
+
+### Was the GCN still faithful to GDRL?
+
+**More faithful than before.** `GDRL/Feature.py` ends with `gnn2(...).squeeze(2)` → a `[35]`
+per-node vector which it concatenates whole. **GDRL never pools.** The `.mean()` was TAMPO's own
+addition. Restoring per-node outputs moves the code *toward* the reference.
+
+Remaining deviations — all pre-existing, now documented in `Papers referred.md`:
+- The **bidirectional stream** is TAMPO's (`grep -c "bwd" GDRL/Feature.py` → `0`).
+- A **mean readout** replaces GDRL's fixed-size concatenation, which assumes 35 nodes; our DAGs are 10–50.
+- A **sequential pointer decoder** (Vinyals et al., 2015) replaces GDRL's single-shot TRPO actor head, because server queue state evolves as nodes are placed.
+
+You can still cite Cai et al. (2025) for the graph feature extractor. Do not describe it as a reproduction of GDRL — suggested phrasing is in `Papers referred.md`.
+
+> ⚠ **Existing checkpoints are incompatible.** The node feature width and GNN output shape both changed. Delete `models/*.pth` and retrain; `TAMPOFramework.load()` raises an explanatory error rather than a shape mismatch.
+
+### What this does and does not prove
+
+It establishes that the policy is now **capable** of a per-node, congestion-aware, preference-conditioned schedule, and that the GCN-vs-GAT comparison is controlled (identical skeleton; the conv operator is the only variable). It does **not** yet show that any encoder learns to use that capability — watch `within_episode_entropy` climb above zero before comparing encoders.
+
+### Training budget — the old runs were barely trained
+
+`num_meta_iterations`, `meta_batch_size`, `num_episodes` and `num_attention_heads` in `default_config.yaml` are **inert**: no Python reads them. Iteration count reaches `train()` from the caller — `Colab_Test_Run.ipynb`'s `NUM_ITERATIONS` (the source of truth) or `main.py`'s `train_iterations`. The YAML keys are now annotated as such.
+
+The real value was `NUM_ITERATIONS = 75`. Measured, at `meta_learning_rate = 5.0e-5` Adam moves each weight by ~`9.3e-6` per meta-iteration against a mean init magnitude of `0.029`:
+
+| iterations | mean \|Δparam\| as % of init scale |
+|---|---|
+| **75** (old) | **2.4%** — essentially untrained |
+| 300 | 9.7% |
+| **1000** (new target) | **32.4%** |
+
+**Do not raise the learning rate to compensate.** A measured sweep collapsed the policy (action entropy → `0.00`) at both `1.5e-4` and `3.0e-4`, while the loss stayed finite and trended *down* in every case. Only the new action-entropy diagnostic catches it.
+
+### Wall-clock cost is the real constraint
+
+Measured per-iteration cost, before vs after this overhaul (CPU, `meta_batch=4`, 10/20/30-node graphs):
+
+| encoder | before | after | change |
+|---|---|---|---|
+| GCN | 3.52 s | 3.28 s | 1.08× faster |
+| GAT | 8.30 s | **4.12 s** | **2.02× faster** (batched conv replaced a per-graph Python loop) |
+| LSTM | 14.09 s | 14.11 s | unchanged |
+
+The overhaul does not make iterations slower. But **LSTM costs ~4× GCN** — CuDNN cannot be used for MAML's second-order gradients — and it dominates any run that trains all three encoders in one loop. A free-tier Colab T4 session (~4 h kill) fits roughly 75 iterations of all three at `meta_batch_size=15`, which is far from converged.
+
+Two changes make this workable:
+
+- **`train(time_budget_s=...)`** stops at an iteration boundary, saves a checkpoint, and prints resume instructions — instead of being killed mid-iteration and losing everything since the last 10-iteration autosave.
+- **`episodes_per_task`** is now a live config key (was hardcoded `5`).
+
+`meta_batch_size` does **not** buy you learning: Adam's step size is ≈ `lr` regardless of how many tasks the gradient averages over. Shrinking it trades gradient quality for more optimiser steps per hour — which is exactly the trade you want on a time-limited session. The notebook now trains **one encoder per session** (`ENCODERS = ['gcn']`) at `META_BATCH_SIZE=6`, `EPISODES_PER_TASK=3`, `TIME_BUDGET_HOURS=3.5`.
+
+Don't chase a fixed iteration number. The stopping rule is behavioural: train until `within_episode_entropy` rises off `0.000` and `avg_makespan` plateaus across two consecutive checkpoints.
+
+### Exact cross-session resume
+
+Because the three encoders need more than one free-Colab session, training is split across sessions — and the split is made **invisible to the result**. Each checkpoint stores the weights, the Adam state, the iteration counter, and the **full RNG stream** (python + numpy + torch). On resume, `train()` restores that stream rather than re-seeding, so a run split across any number of sessions is **bit-identical** to one continuous run. Verified: `3+3` and `2+2+2` iteration splits each reproduce a continuous 6-iteration run exactly.
+
+Two determinism fixes made this work: seeding now happens in `__init__` **before** weight initialisation (it was in `train()`, after — so initial weights weren't reproducible), and the RNG state is checkpointed (it wasn't). `save()` now delegates to `_save_checkpoint` so it can't silently drop the RNG state; writes are atomic.
+
+Every encoder is seeded identically at construction, so all three face the **identical** sequence of graphs, preferences and channel conditions — only their weights and actions differ. That is what makes the comparison controlled.
+
+**Operator guide:** `docs/RUNNING_THE_EXPERIMENT.md` walks through three cases — multiple free Colab sessions (Drive-backed, auto-resuming), a single long VM session, and a multi-seed publication run. The notebook training cell is an auto-advancing driver: set it once, re-run each session, and it pours the budget into `gcn → gat → lstm` until each reaches target, resuming exactly.
+
+---
+
+## Reward-Signal & Determinism Overhaul (2026-07-10)
+
+Two from-scratch Colab runs on identical code reported `avg_energy` of **0.59 J** and **6863 J** for the same algorithm. Root-caused and fixed. Full analysis in `dev_logs/reward_signal_and_determinism_overhaul.md`.
+
+| Area | What Changed | Why It Matters |
+|---|---|---|
+| `default_config.yaml` | `kappa: 1e-23` → `1e-27` | Real DAG nodes take `cycles` from the `.gv` `expect_size` (~2.8e7), not `task_cycles_range` (~1e9). At 1e-23 a local node cost **283 J** vs **0.04 J** for cloud — `total_energy` just counted local picks, and `e_imp` saturated at 0.9998 (cloud) vs 0.9999 (edge), giving no gradient to tell servers apart. |
+| `base_offloading_env.py` | Congestion penalty now measures the **real** queue wait | It was recomputed *after* `_execute_offloading` had overwritten `server_available`, so it reduced to `min(comp_delay/5, 1)` — it never measured queueing at all. |
+| `base_offloading_env.py` | Comm penalty uses the actual Shannon-rate transfer time | It divided raw bytes by raw `bandwidth_up` (42× below the real datarate) and pinned at exactly 1.0 whenever any parent was cross-server. |
+| `base_offloading_env.py` | `step()` returns `info['r_delay']`, `info['r_energy']` | The reward carrying both penalties was computed, stored on the experience dict, and **never read by any loss function**. |
+| `tampo.py` | `mo_return` discounts the env's reward components | The agent was optimising queue-free comp-delay while being scored on queue-driven makespan. |
+| `tampo.py` | PPO clipped surrogate in the MAML inner loop | `inner_steps: 5` reused one on-policy batch with uncorrected vanilla policy gradient. |
+| `utils/seeding.py` (new) | `set_seed()` wired into `main.py`, `benchmark.py`, notebook | Training was **completely unseeded**. Evaluation was seeded; training was not. |
+| `main.py` | `setup_environment()` reads `config['environment']` | Every section lookup returned `{}`, so the env ignored `default_config.yaml` entirely and used hardcoded defaults. |
+
+### Reproducibility
+
+A fixed seed makes one run **repeatable**; it does not make it **representative**. Before concluding one encoder beats another, run across `utils.seeding.SEEDS` and report mean ± std:
+
+```bash
+for s in 0 1 2 3 4; do python benchmark.py --seed $s --output_dir results/seed_$s; done
+```
+
+A single-seed three-way table cannot distinguish a real architectural difference from luck.
+
+### Known limitation
+
+The task's own upload time is still **not** charged to the timeline (`finish_time = start_time + comp_delay`); `trans_time` feeds only the energy formula. For the median node, cloud upload takes 0.083 s while local execution takes 0.028 s, so offloading should often be *slower*. Fixing this changes the physics engine and invalidates all previously reported numbers — see §9 of the dev log.
+
+---
+
 ## Convergence Overhaul (2026-07-06)
 
 A professional root-cause analysis identified **15 distinct reasons** the TAMPO agent was failing to converge. All 15 have been fixed. See `dev_logs/convergence_fixes_overhaul.md` for full details.
+
+> ⚠️ **RC#15 in the table below is superseded.** Its `kappa: 1e-28 → 1e-23` change was justified with arithmetic that was wrong by nine orders of magnitude and assumed `cycles ≈ 1e9`. It has been reverted to `1e-27`. See the 2026-07-10 overhaul above.
 
 ### Critical Fixes Applied
 
