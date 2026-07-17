@@ -18,7 +18,18 @@ import numpy as np
 import torch
 
 # Suggested seed set for multi-seed benchmark reporting.
-SEEDS = (0, 1, 2, 3, 4)
+#
+# Eight, not five, and the reason is not a rule of thumb: a two-sided Wilcoxon signed-rank
+# test on n paired seeds has a hard floor on the p-value it can return, because there are
+# only 2^n sign assignments.  At n=5 that floor is 0.0625 -- so a 5-seed comparison can
+# NEVER reach p<0.05 no matter how decisively one encoder wins.  n=6 floors at 0.031 (and
+# only clears 0.05 if one encoder wins on literally every seed); n=8 floors at 0.0078,
+# which leaves room to lose a seed and still show significance.
+#
+# If compute forces fewer than 6 seeds, report mean +/- std and state plainly that the
+# study is descriptive and not powered for significance testing.
+# Aggregate with `python utils/aggregate_seeds.py`; see docs/RUNNING_THE_EXPERIMENT.md.
+SEEDS = (0, 1, 2, 3, 4, 5, 6, 7)
 
 
 def set_seed(seed: int, deterministic_torch: bool = False) -> int:

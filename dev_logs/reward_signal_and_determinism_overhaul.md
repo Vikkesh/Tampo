@@ -166,6 +166,57 @@ a different seed diverges.
 > GCN-vs-GAT-vs-LSTM table cannot distinguish a real architectural difference from luck. Report
 > mean +/- std over `utils.seeding.SEEDS`.
 
+### 4.1 Update (2026-07-17): `SEEDS` corrected from 5 to 8, and multi-seed tooling added
+
+`SEEDS = (0,1,2,3,4)` was a bad default, and `docs/RUNNING_THE_EXPERIMENT.md` compounded it by
+calling `k = 5` "the practical minimum" for a Wilcoxon signed-rank test. That is arithmetically
+impossible advice.
+
+A two-sided Wilcoxon on `n` paired samples enumerates `2^n` sign assignments, so the smallest
+p-value it can *ever* return is `2 / 2^n`. Measured with scipy against perfectly separated data
+(one arm beating the other on every seed by a factor of 10):
+
+| n | 3 | 4 | **5** | **6** | 7 | 8 | 10 |
+|---|---|---|---|---|---|---|---|
+| best attainable two-sided p | 0.250 | 0.125 | **0.0625** | **0.031** | 0.016 | 0.0078 | 0.002 |
+
+At `k = 5` the test cannot reach `p < 0.05` under any outcome. Five full training runs would
+have been spent on a test that was incapable of passing, and the resulting `p = 0.0625` would
+most likely have been misread as "no difference" when it actually means "no verdict possible".
+
+**Fix:**
+- `utils/seeding.py`: `SEEDS = (0,...,7)`, with the derivation in a comment so the number is not
+  silently "rounded back down" later. `k >= 6` to claim significance, `k = 8` for margin.
+- `utils/aggregate_seeds.py` (new): aggregates `results/seed_*/run_*/benchmark_results.csv` into
+  `mean +/- std` per `(encoder, metric)` and runs paired Wilcoxon per encoder pair. When `n < 6`
+  it prints the attainable floor instead of a bare "NOT significant". Stdlib `csv` +
+  `statistics`; scipy only for the test, and it degrades to the descriptive table without it.
+- `README.md`: its multi-seed snippet looped `benchmark.py --seed $s` over one checkpoint dir —
+  that only re-seeds *evaluation* and measures nothing about training variance. Multi-seed
+  requires **retraining** per seed into a per-seed checkpoint dir; corrected.
+- `docs/RUNNING_THE_EXPERIMENT.md`: Case 3 rewritten with the seed-count table, a compute-budget
+  formula anchored to the user's real measured T4 rate, per-seed directory layout, and the
+  `DRIVE_ROOT`/`SEED` coupling that voids the study if changed independently.
+
+### 4.2 Update (2026-07-17): golden dataset in a fresh session
+
+`data/test_dags.json` is untracked, so a re-cloned Colab VM has no test set — but the notebook
+said "Run **once only**. Never re-run", which read as "do not regenerate" and left no way to get
+the file back. Two further problems: the cell generated `--num_dags 20` while the docs claimed
+500 (a 20-DAG test set is far too small to publish from), and nothing verified the set was stable
+across sessions.
+
+Confirmed by reading the full path that generation is deterministic: `DAGParser.load_dataset`
+sorts `os.listdir` and slices at a fixed `offset=20`; `parse_gv_file` is a pure parse of the
+committed `.gv` files; `grep` finds no RNG anywhere in `utils/dag_parser.py`. Same commit + same
+args ⇒ byte-identical output. (Could not execute it locally — `networkx` is absent and the user's
+standing instruction is to install nothing — so this rests on reading, and the notebook now
+prints an MD5 so the invariant is checked at runtime rather than asserted here.)
+
+**Fix:** the Section 2 cell now generates 500 DAGs, prints an MD5 + size histogram, asserts the
+count, and is documented as "run in every new session". The freeze applies to the *arguments*,
+not the file. A Drive copy/restore alternative is documented for anyone who prefers it.
+
 ---
 
 ## 5. Root Cause: The MAML Inner Loop Was Off-Policy and Uncorrected

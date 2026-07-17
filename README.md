@@ -415,13 +415,21 @@ Two from-scratch Colab runs on identical code reported `avg_energy` of **0.59 J*
 
 ### Reproducibility
 
-A fixed seed makes one run **repeatable**; it does not make it **representative**. Before concluding one encoder beats another, run across `utils.seeding.SEEDS` and report mean ± std:
+A fixed seed makes one run **repeatable**; it does not make it **representative**. A single-seed three-way table cannot distinguish a real architectural difference from luck.
+
+Multi-seed means **retraining** under each seed — re-benchmarking one set of weights under different evaluation seeds measures nothing about training variance. Each seed needs its own checkpoint dir and its own results dir:
 
 ```bash
-for s in 0 1 2 3 4; do python benchmark.py --seed $s --output_dir results/seed_$s; done
+for s in 0 1 2 3 4 5 6 7; do
+  # train all three encoders with seed=$s into models_seed_$s/  (see docs)
+  python benchmark.py --seed 42 --checkpoint_dir models_seed_$s --output_dir results/seed_$s
+done
+python utils/aggregate_seeds.py --results_root results --seeds 0 1 2 3 4 5 6 7
 ```
 
-A single-seed three-way table cannot distinguish a real architectural difference from luck.
+`utils.seeding.SEEDS` has **8** seeds, not 5, for a concrete reason: a two-sided Wilcoxon on 5 paired seeds floors at p = 0.0625, so it can never reach p < 0.05 however decisively one encoder wins. Use ≥ 6 seeds to claim significance, or report mean ± std and say the study is descriptive.
+
+Full walkthrough, compute budget and aggregation: **`docs/RUNNING_THE_EXPERIMENT.md` (Case 3)**.
 
 ### Known limitation
 
