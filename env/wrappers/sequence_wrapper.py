@@ -14,10 +14,14 @@ class SequenceWrapper(gym.Wrapper):
     numerical node order.
     """
 
-    def __init__(self, env, max_tasks: int = 30, task_feature_dim: int = 6):
+    def __init__(self, env, max_tasks: int = 30, task_feature_dim: int = None):
         super().__init__(env)
         self.max_tasks = max_tasks
-        self.task_feature_dim = task_feature_dim
+        # Default to the env's own width rather than a literal (see FlatVectorWrapper).
+        self.task_feature_dim = (
+            task_feature_dim if task_feature_dim is not None
+            else getattr(env, 'task_feature_dim', 9)
+        )
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
@@ -52,7 +56,7 @@ class SequenceWrapper(gym.Wrapper):
     # ── observation builder ─────────────────────────────────────────────────
     def _build_sequence_obs(self) -> np.ndarray:
         """Read the current task graph from the env and return a sorted sequence."""
-        task_features = self.env.get_task_feature_matrix()  # [N, 6]
+        task_features = self.env.get_task_feature_matrix()  # [N, task_feature_dim]
         adj_matrix = self.env.get_adjacency_matrix()
 
         N = task_features.shape[0]

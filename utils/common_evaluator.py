@@ -99,70 +99,150 @@ class CommonEvaluator:
         
         return result
     
-    def evaluate_rl_agent(self, agent, agent_type: str) -> Dict:
+    def evaluate_rl_agent(self, agent, agent_type: str,
+                           test_dags: list = None) -> Dict:
         """
         Evaluate RL-based algorithms (PPO, GMORL, TAM-PO)
-        
+
         Args:
-            agent: Agent instance (PPOAgent, GMORLAgent, TAMPOFramework)
+            agent:      Agent instance (PPOAgent, GMORLAgent, TAMPOFramework)
             agent_type: Type of agent ('ppo', 'gmorl', 'tampo')
-            
+            test_dags:  Explicit list of DAG dicts to evaluate on.  Every
+                        algorithm in the same benchmark run receives this SAME
+                        list in the SAME order, guaranteeing a fair comparison.
+                        If None, falls back to the env's loaded task_dataset.
+
         Returns:
             Dictionary with metrics
         """
         print(f"\n📊 Evaluating {agent_type.upper()}...")
-        
-        delays = []
+
+        delays   = []
         energies = []
-        
-        # Evaluate across all preference vectors
-        episodes_per_pref = self.num_episodes // len(self.eval_preferences)
-        
-        for pref_idx, preference in enumerate(self.eval_preferences):
-            for episode in range(episodes_per_pref):
-                # Use fixed seed for this episode
-                episode_idx = pref_idx * episodes_per_pref + episode
-                np.random.seed(self.eval_seeds[episode_idx])
-                
-                if agent_type == 'tampo' and len(getattr(self.env, 'task_dataset', [])) > 0:
-                    task_id = episode_idx % len(self.env.task_dataset)
-                    if hasattr(self.env, 'set_task'):
-                        self.env.set_task(task_id)
-                elif hasattr(self.env, 'clear_task_selection'):
-                    self.env.clear_task_selection()
-                
-                # Reset environment with preference
-                state = self.env.reset(preference_vector=preference)
-                
-                episode_delay = 0
-                episode_energy = 0
-                done = False
+
+        # Determine the DAG pool to evaluate on
+        if test_dags is not None:
+            dags_to_eval = test_dags
+        elif len(getattr(self.env, 'task_dataset', [])) > 0:
+            dags_to_eval = self.env.task_dataset
+        else:
+            print("  ⚠ No test DAGs available — cannot evaluate.")
+            return None
+
+        # Per-episode action traces, so the reported metrics can be traced back to the
+        # placements that produced them.  A policy that emits one action for every node
+        # is degenerate; without this you cannot see that from makespan/energy alone.
+        action_traces = []
+
+        # Evaluate every (dag, preference) combination.
+        # Each algorithm sees IDENTICAL dags in IDENTICAL order.
+        episode_idx = 0
+        for dag_idx, dag in enumerate(dags_to_eval):
+            for preference in self.eval_preferences:
+                np.random.seed(1000 + episode_idx)   # reproducible noise per episode
+                episode_idx += 1
+
+                # Hard-reset with the explicit DAG — bypasses set_task() entirely
+                state = self.env.reset(task_graph=dag, preference_vector=preference)
+
+                done  = False
                 steps = 0
-                
+                actions = []
+
                 while not done and steps < self.max_steps_per_episode:
-                    # Select action (deterministic for evaluation)
                     action = self._get_action(agent, agent_type, state, preference)
-                    
-                    # Step environment
                     next_state, reward, done, info = self.env.step(action)
-                    
-                    # Accumulate metrics
-                    episode_delay = info.get('makespan', info.get('total_delay', 0))
-                    episode_energy = info.get('total_energy', 0)
-                    
-                    state = next_state
+                    actions.append(int(action))
+                    state  = next_state
                     steps += 1
-                
-                delays.append(episode_delay)
-                energies.append(episode_energy)
-        
+
+                # Read final accumulated metrics from the environment
+                delays.append(self.env.total_delay)
+                energies.append(self.env.total_energy)
+                action_traces.append({
+                    'dag_index': dag_idx,
+                    'num_tasks': len(actions),
+                    'w_delay': float(preference[0]),
+                    'w_energy': float(preference[1]),
+                    'actions': actions,
+                    'makespan': float(self.env.total_delay),
+                    'energy': float(self.env.total_energy),
+                })
+
         # Calculate metrics
         result = self._calculate_metrics(delays, energies)
-        
-        print(f"  ✓ Avg Makespan: {result['avg_makespan']:.4f}s")
-        print(f"  ✓ Avg Energy: {result['avg_energy']:.4f}J")
-        
+        result['action_traces'] = action_traces
+        result['action_summary'] = self._summarize_actions(action_traces)
+
+        print(f"  ✓ Episodes      : {len(delays)} ({len(dags_to_eval)} DAGs × {len(self.eval_preferences)} preferences)")
+        print(f"  ✓ Avg Makespan  : {result['avg_makespan']:.4f}s")
+        print(f"  ✓ Avg Energy    : {result['avg_energy']:.6f}J")
+        self._print_action_summary(result['action_summary'])
+
         return result
+
+    ACTION_NAMES = ['local', 'cloud', 'edge0', 'edge1', 'edge2']
+
+    def _action_label(self, action: int) -> str:
+        if action < len(self.ACTION_NAMES):
+            return self.ACTION_NAMES[action]
+        return f"srv{action}"
+
+    def _summarize_actions(self, traces: List[Dict]) -> Dict:
+        """
+        Aggregate action usage overall and per preference vector.
+
+        `per_episode_entropy` is the mean normalised entropy of the action distribution
+        WITHIN an episode.  0.0 means the agent placed every node of a DAG on the same
+        server — the degenerate policy.  This is the number that reveals whether the
+        agent is scheduling or just picking one server per graph.
+        """
+        n_actions = self.env.action_space.n
+        overall = np.zeros(n_actions, dtype=np.int64)
+        per_pref = {}
+        episode_entropies = []
+
+        for tr in traces:
+            counts = np.bincount(tr['actions'], minlength=n_actions).astype(np.int64)
+            overall += counts
+
+            key = (tr['w_delay'], tr['w_energy'])
+            per_pref.setdefault(key, np.zeros(n_actions, dtype=np.int64))
+            per_pref[key] += counts
+
+            total = counts.sum()
+            if total > 0 and n_actions > 1:
+                p = counts[counts > 0] / total
+                episode_entropies.append(float(-(p * np.log(p)).sum() / np.log(n_actions)))
+
+        def _frac(c):
+            t = c.sum()
+            return (c / t).tolist() if t else [0.0] * n_actions
+
+        return {
+            'overall_fractions': _frac(overall),
+            'per_preference_fractions': {f"{k[0]:.1f}/{k[1]:.1f}": _frac(v) for k, v in per_pref.items()},
+            'mean_per_episode_entropy': float(np.mean(episode_entropies)) if episode_entropies else 0.0,
+            'degenerate_episodes': int(sum(1 for e in episode_entropies if e < 1e-9)),
+            'total_episodes': len(traces),
+        }
+
+    def _print_action_summary(self, summary: Dict) -> None:
+        n = len(summary['overall_fractions'])
+        names = " ".join(
+            f"{self._action_label(a)}={summary['overall_fractions'][a]*100:4.1f}%" for a in range(n)
+        )
+        print(f"  ✓ Actions       : {names}")
+        print(f"  ✓ Within-episode entropy: {summary['mean_per_episode_entropy']:.3f} "
+              f"(0 = one server for the whole DAG, 1 = uniform)")
+        if summary['degenerate_episodes']:
+            print(f"  ⚠ {summary['degenerate_episodes']}/{summary['total_episodes']} episodes "
+                  f"placed EVERY node on a single server — policy is degenerate.")
+        print("    Action mix per preference (delay/energy):")
+        for pref, fracs in summary['per_preference_fractions'].items():
+            mix = " ".join(f"{self._action_label(a)}={fracs[a]*100:4.1f}%" for a in range(n))
+            print(f"      {pref:>8s} → {mix}")
+
     
     def _get_action(self, agent, agent_type: str, state: np.ndarray, preference: np.ndarray) -> int:
         """
@@ -205,54 +285,34 @@ class CommonEvaluator:
     def _calculate_metrics(self, delays: List[float], energies: List[float]) -> Dict:
         """
         Calculate standardized metrics
-        
-        Args:
-            delays: List of delay values
-            energies: List of energy values
-            
-        Returns:
-            Dictionary with metrics
+
+        NOTE: No outlier filtering is applied.  Removing different numbers of
+        episodes per algorithm makes the averages non-comparable — an "outlier"
+        for LSTM is a real evaluation episode that GCN also ran on.  All episodes
+        are included so every algorithm is scored on identical data.
         """
-        delays = np.array(delays)
+        delays   = np.array(delays)
         energies = np.array(energies)
-        
-        # Remove outliers (>3 std dev)
-        delay_mean = np.mean(delays)
-        delay_std = np.std(delays)
-        energy_mean = np.mean(energies)
-        energy_std = np.std(energies)
-        
-        # Filter outliers
-        delay_mask = np.abs(delays - delay_mean) <= 3 * delay_std
-        energy_mask = np.abs(energies - energy_mean) <= 3 * energy_std
-        valid_mask = delay_mask & energy_mask
-        
-        if np.sum(valid_mask) < len(delays) * 0.8:
-            # If too many outliers, don't filter
-            valid_delays = delays
-            valid_energies = energies
-        else:
-            valid_delays = delays[valid_mask]
-            valid_energies = energies[valid_mask]
-        
+
         metrics = {
-            'avg_makespan': np.mean(valid_delays),
-            'std_makespan': np.std(valid_delays),
-            'min_makespan': np.min(valid_delays),
-            'max_makespan': np.max(valid_delays),
-            'median_makespan': np.median(valid_delays),
-            
-            'avg_energy': np.mean(valid_energies),
-            'std_energy': np.std(valid_energies),
-            'min_energy': np.min(valid_energies),
-            'max_energy': np.max(valid_energies),
-            'median_energy': np.median(valid_energies),
-            
-            'num_episodes': len(valid_delays),
-            'num_outliers_removed': len(delays) - len(valid_delays)
+            'avg_makespan':    np.mean(delays),
+            'std_makespan':    np.std(delays),
+            'min_makespan':    np.min(delays),
+            'max_makespan':    np.max(delays),
+            'median_makespan': np.median(delays),
+
+            'avg_energy':    np.mean(energies),
+            'std_energy':    np.std(energies),
+            'min_energy':    np.min(energies),
+            'max_energy':    np.max(energies),
+            'median_energy': np.median(energies),
+
+            'num_episodes':        len(delays),
+            'num_outliers_removed': 0,   # no longer filtered
         }
-        
+
         return metrics
+
     
     def compare_algorithms(self, results: Dict[str, Dict]) -> None:
         """

@@ -10,6 +10,7 @@ from env.base_offloading_env import TaskOffloadingEnv
 from utils.dag_parser import DAGParser
 from utils.metrics import calculate_hypervolume, normalize_objectives
 from utils.common_evaluator import CommonEvaluator
+from utils.seeding import set_seed
 
 from algorithms.heuristic.heft import HEFTScheduler
 from algorithms.heuristic.pso import PSOScheduler
@@ -25,14 +26,19 @@ def load_config(config_path):
     return config
 
 def setup_environment(config):
-    """Setup the task offloading environment"""
-    env_config = {
-        **config.get('system', {}),
-        **config.get('computing', {}),
-        **config.get('energy', {}),
-        **config.get('network', {}),
-        **config.get('tasks', {})
-    }
+    """
+    Setup the task offloading environment.
+
+    The physics sections live under `environment:` in default_config.yaml. Reading them
+    off the top-level dict silently yielded {} for every section, so the env fell back
+    to its hardcoded defaults and ignored the config file entirely. `reward` was dropped
+    the same way, leaving the congestion/comm weights at their defaults.
+    """
+    env_cfg = config.get('environment', config)
+    env_config = {}
+    for section in ('system', 'computing', 'energy', 'network', 'tasks'):
+        env_config.update(env_cfg.get(section, {}))
+    env_config['reward'] = env_cfg.get('reward', {})
     env = TaskOffloadingEnv(env_config)
     return env
 
@@ -78,9 +84,12 @@ def get_user_input():
     
     tampo_gcn_run = input("Run TAMPO-GCN? (yes/no): ").strip().lower()
     algorithms['TAMPO_GCN'] = tampo_gcn_run in ['yes', 'y']
-    
+
+    tampo_gat_run = input("Run TAMPO-GAT? (yes/no): ").strip().lower()
+    algorithms['TAMPO_GAT'] = tampo_gat_run in ['yes', 'y']
+
     # Common training/evaluation parameters for RL
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN'], algorithms['TAMPO_GAT']]):
         print("\n\nRL TRAINING & EVALUATION PARAMETERS:")
         print("-" * 40)
         
@@ -97,7 +106,7 @@ def get_user_input():
         else:
             algorithms['gmorl_episodes'] = 100
         
-        if algorithms['TAMPO_LSTM'] or algorithms['TAMPO_GCN']:
+        if algorithms['TAMPO_LSTM'] or algorithms['TAMPO_GCN'] or algorithms['TAMPO_GAT']:
             tampo_iterations = input("Number of meta-iterations for TAMPO (default 100): ").strip()
             algorithms['tampo_iterations'] = int(tampo_iterations) if tampo_iterations else 100
         else:
@@ -132,6 +141,8 @@ def get_user_input():
         selected.append(f"TAMPO_LSTM ({algorithms['tampo_iterations']} meta-iterations)")
     if algorithms['TAMPO_GCN']:
         selected.append(f"TAMPO_GCN ({algorithms['tampo_iterations']} meta-iterations)")
+    if algorithms['TAMPO_GAT']:
+        selected.append(f"TAMPO_GAT ({algorithms['tampo_iterations']} meta-iterations)")
     
     if len(selected) == 0:
         print("\n⚠️  No algorithms selected. Exiting...")
@@ -144,7 +155,7 @@ def get_user_input():
     if any([algorithms['HEFT'], algorithms['PSO'], algorithms['GA']]):
         print(f"\nHeuristic test tasks: {algorithms['heuristic_tasks']}")
     
-    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN']]):
+    if any([algorithms['PPO'], algorithms['GMORL'], algorithms['TAMPO_LSTM'], algorithms['TAMPO_GCN'], algorithms['TAMPO_GAT']]):
         print(f"RL evaluation episodes: {algorithms['eval_episodes']} (common for all RL algorithms)")
     
     print("\n" + "="*70)
@@ -272,9 +283,14 @@ def test_tampo(env, dag_parser, config, evaluator, train_iterations=100, encoder
     env.load_task_dataset(tasks_for_env)
     print(f"✓ Loaded {len(tasks_for_env)} tasks")
     
-    # Create TAM-PO framework - checkpoint loaded automatically in __init__
+    # Create TAM-PO framework - checkpoint loaded automatically in __init__.
+    # Pass the seed so weight init is deterministic (seeding happens before network
+    # construction inside __init__); on resume the checkpoint's RNG overrides it.
     print(f"\n[6/6] Training TAM-PO ({train_iterations} meta-iterations)...")
-    tampo_framework = TAMPOFramework(env, tampo_config, model_path=checkpoint_path)
+    tampo_framework = TAMPOFramework(
+        env, tampo_config, model_path=checkpoint_path,
+        seed=config.get('experiment', {}).get('seed', 42)
+    )
     
     # Train
     tampo_framework.train(
@@ -406,7 +422,13 @@ def main():
     print("\n📋 Loading configuration...")
     config = load_config('configs/default_config.yaml')
     print("✓ Configuration loaded")
-    
+
+    # Seed every RNG before any network or env is constructed
+    exp_cfg = config.get('experiment', {})
+    seed = set_seed(exp_cfg.get('seed', 42),
+                    deterministic_torch=exp_cfg.get('deterministic_torch', False))
+    print(f"✓ Seed set to {seed}")
+
     # Setup environment
     print("\n🏗️  Setting up environment...")
     env = setup_environment(config)
@@ -419,7 +441,7 @@ def main():
     print("\n🔧 Initializing Common Evaluator...")
     evaluator = CommonEvaluator(env, {
         'eval_episodes': user_choices['eval_episodes'],
-        'max_steps': config['system']['max_steps']
+        'max_steps': config['environment']['system']['max_steps']
     })
     
     # Run selected algorithms
@@ -473,7 +495,16 @@ def main():
         )
         if result:
             results['TAMPO_GCN'] = result
-    
+
+    if user_choices['TAMPO_GAT']:
+        result = test_tampo(
+            env, dag_parser, config, evaluator,
+            user_choices['tampo_iterations'],
+            encoder_type='gat'
+        )
+        if result:
+            results['TAMPO_GAT'] = result
+
     # Display detailed comparison using common evaluator
     if len(results) > 0:
         evaluator.compare_algorithms(results)

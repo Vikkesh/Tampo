@@ -106,7 +106,29 @@ class TaskOffloadingEnv(gym.Env):
         self.total_delay = 0
         self.total_energy = 0
         self.completed_tasks = 0
-        
+
+        # DAG timeline state. Initialised here as well as in reset() because
+        # get_server_features() reads server_available and may be called before the
+        # first reset (e.g. by wrappers sizing their observation space).
+        self.node_finish_times = None
+        self.node_assignments = None
+        self.server_available = np.zeros(self.action_space.n)
+        self.current_node_idx = 0
+        self.topo_order = None
+
+        # Per-step scheduling diagnostics (see reset())
+        self._last_queue_wait = 0.0
+        self._last_comm_time = 0.0
+
+    # Width of get_task_feature_matrix(). Consumers must read this rather than
+    # hardcoding a literal — it grew from 6 to 9 when is_current / is_scheduled /
+    # assigned_server were added so the policy could see which node it is scheduling.
+    TASK_FEATURE_DIM = 9
+
+    @property
+    def task_feature_dim(self) -> int:
+        return self.TASK_FEATURE_DIM
+
     def _setup_observation_space(self):
         """Setup observation space based on task type"""
         if self.task_type == 'dag':
@@ -211,13 +233,37 @@ class TaskOffloadingEnv(gym.Env):
         return None
 
     def get_server_features(self) -> np.ndarray:
-        """Build the structured server feature vector used by TAMPO."""
+        """
+        Build the structured server feature vector used by TAMPO.
+
+        Includes the live queue state. `self.server_loads` was previously used here but
+        is only ever assigned zeros — `_execute_offloading` advances `server_available`,
+        a different array — so the agent saw a constant `[0,0,0,0]` load vector for the
+        whole episode and was structurally blind to congestion.
+
+        `server_available` holds the time each processor next becomes free, one entry per
+        action (local, cloud, edge_0..n). It is reported two ways:
+          * relative load: each server's availability over the busiest server's, in [0,1].
+            Tells the agent *which* processor is the bottleneck right now.
+          * absolute load: squashed with tanh so it stays bounded as makespan grows.
+            Tells the agent *how loaded* the system is overall.
+        """
         channel_gains = self.channel_gains if self.channel_gains is not None else np.zeros(self.num_servers)
+
+        avail = np.asarray(self.server_available, dtype=np.float32)
+        rel_load = avail / max(float(avail.max()), 1e-9)
+        abs_load = np.tanh(avail)
+
+        num_nodes = len(self.current_task['tasks']) if self._is_dag_task() and self.current_task else 1
+        progress = float(self.current_node_idx) / max(num_nodes, 1)
+
         server_features = np.concatenate([
             [self.cloud_freq / 10e9],
             self.edge_freq / 10e9,
-            self.server_loads / 10.0,
-            channel_gains / 2.0
+            rel_load,
+            abs_load,
+            channel_gains / 2.0,
+            [progress]
         ]).astype(np.float32)
 
         if len(server_features) < 20:
@@ -229,16 +275,21 @@ class TaskOffloadingEnv(gym.Env):
         """
         Build a per-node feature matrix for the active task graph.
 
-        Feature layout:
-        [data_size, cycles, in_degree, out_degree, depth, comm_load]
+        Feature layout (width == TASK_FEATURE_DIM):
+        [data_size, cycles, in_degree, out_degree, depth, comm_load,
+         is_current, is_scheduled, assigned_server_norm]
         """
         if self.current_task is None:
-            return np.zeros((1, 6), dtype=np.float32)
+            return np.zeros((1, self.TASK_FEATURE_DIM), dtype=np.float32)
 
         if not self._is_dag_task():
             size_norm = self.current_task['size'] / max(self.task_size_range[1], 1.0)
             cycles_norm = self.current_task['cycles'] / max(self.task_cycles_range[1], 1.0)
-            return np.array([[size_norm, cycles_norm, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+            # A lone independent task is always the current, unscheduled node.
+            return np.array(
+                [[size_norm, cycles_norm, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]],
+                dtype=np.float32
+            )
 
         adj_matrix = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
         num_nodes = adj_matrix.shape[0]
@@ -260,15 +311,31 @@ class TaskOffloadingEnv(gym.Env):
         max_size = max(float(self.task_size_range[1]), 1.0)
         max_cycles = max(float(self.task_cycles_range[1]), 1.0)
 
+        # Which node is the agent deciding for right now?  Without this the policy
+        # receives the identical [N, F] matrix at every step of an episode and cannot
+        # tell node 3 from node 17 — it can only emit one action for the whole DAG.
+        current_node = (
+            self.topo_order[self.current_node_idx]
+            if self.topo_order is not None and self.current_node_idx < len(self.topo_order)
+            else -1
+        )
+        num_actions = self.action_space.n
+
         features = []
         for idx, task in enumerate(tasks):
+            assigned = self.node_assignments[idx] if self.node_assignments is not None else -1
             features.append([
                 float(task.get('data_size', 0.0)) / max_size,
                 float(task.get('cycles', 0.0)) / max_cycles,
                 float(in_degree[idx]) / degree_scale,
                 float(out_degree[idx]) / degree_scale,
                 float(depths[idx]) / max_depth,
-                float(comm_load[idx]) / max_comm
+                float(comm_load[idx]) / max_comm,
+                1.0 if idx == current_node else 0.0,          # is_current
+                0.0 if assigned < 0 else 1.0,                 # is_scheduled
+                # Where an already-scheduled node landed, so the agent can co-locate a
+                # child with its parents and avoid the cross-server communication cost.
+                0.0 if assigned < 0 else (float(assigned) + 1.0) / float(num_actions),
             ])
 
         return np.asarray(features, dtype=np.float32)
@@ -326,7 +393,12 @@ class TaskOffloadingEnv(gym.Env):
         self.server_available = np.zeros(self.action_space.n)
         self.current_node_idx = 0
         self.topo_order = None
-        
+
+        # Per-step scheduling diagnostics, written by _execute_offloading and read
+        # by _calculate_reward (which runs after server_available has been advanced).
+        self._last_queue_wait = 0.0
+        self._last_comm_time = 0.0
+
         # Update channel gains
         self._update_channel_gains()
         
@@ -407,27 +479,35 @@ class TaskOffloadingEnv(gym.Env):
             bw_up = self._get_datarate(0) if server_idx == 1 else self._get_datarate(server_idx - 1) * 1.5
 
         cross_server_energy = 0.0
+        total_comm_time = 0.0
 
         for edge in edges:
             if edge['target'] == node_id:
                 parent_id = edge['source']
                 parent_finish = self.node_finish_times[parent_id]
                 parent_server = self.node_assignments[parent_id]
-                
+
                 if parent_server == server_idx:
                     comm_cost = 0.0
                 else:
                     comm_data = float(edge.get('data', 0))
                     comm_cost = comm_data / max(bw_up, 1e-9)
+                    total_comm_time += comm_cost
                     # Add transmission energy penalty for cross-server
                     if parent_server == 1:
                         cross_server_energy += comm_cost * self.cloud_power_tx
                     elif parent_server > 1:
                         cross_server_energy += comm_cost * self.edge_power_tx
-                    
+
                 data_ready = max(data_ready, parent_finish + comm_cost)
 
         # 2. Earliest start time (when dependencies are met AND processor is free)
+        # Capture the real queue wait BEFORE server_available is overwritten below.
+        # _calculate_reward runs after this method, by which point
+        # server_available[action] == node_finish_times[node_id] == finish_time,
+        # so it cannot reconstruct the wait itself.
+        self._last_queue_wait = max(0.0, self.server_available[server_idx] - data_ready)
+        self._last_comm_time = total_comm_time
         start_time = max(data_ready, self.server_available[server_idx])
 
         # 3. Computation delay
@@ -446,6 +526,9 @@ class TaskOffloadingEnv(gym.Env):
         self.node_finish_times[node_id] = finish_time
         self.node_assignments[node_id] = server_idx
         self.server_available[server_idx] = finish_time
+        # Keep server_loads consistent with the real timeline (it used to stay at zeros
+        # forever while render()/info reported it as the load).
+        self.server_loads = self.server_available[1:].copy()
 
         # 5. Energy calculation
         if server_idx == 0:
@@ -539,59 +622,79 @@ class TaskOffloadingEnv(gym.Env):
         
         return obs.astype(np.float32)
     
-    def _calculate_reward(self, delay: float, energy: float) -> float:
+    def _calculate_reward(self, delay: float, energy: float) -> Tuple[float, float, float]:
         """
-        Calculates dense reward combining local improvement, server congestion, and communication penalties.
+        Calculates the dense reward combining local improvement, server congestion,
+        and communication penalties.
+
+        Returns:
+            (reward, r_delay, r_energy) where r_delay and r_energy are the two
+            per-objective components, each already clipped to [-1, 1].  The scalar
+            `reward` is their preference-weighted sum.  The components are surfaced
+            through step()'s info dict so a multi-objective learner can discount
+            them independently instead of re-deriving improvements from raw
+            delay/energy (which silently drops both penalties).
         """
         # Load weights from config
         reward_cfg = self.config.get('reward', {})
         w_cong = _coerce_float(reward_cfg.get('congestion_penalty_weight', 0.4), 0.4)
         w_comm = _coerce_float(reward_cfg.get('comm_penalty_weight', 0.3), 0.3)
-        
+
         if not self._is_dag_task():
             # Fallback for independent tasks
             local_delay = self.current_task['cycles'] / self.local_freq
             local_energy = self.kappa * self.current_task['cycles'] * (self.local_freq ** 2)
-            d_imp = (local_delay - delay) / max(local_delay, 1e-9)
-            e_imp = (local_energy - energy) / max(local_energy, 1e-9)
-            return float(np.clip(5.0 * (self.preference[0] * d_imp + self.preference[1] * e_imp), -5.0, 5.0))
+            d_imp = float(np.clip((local_delay - delay) / max(local_delay, 1e-9), -1.0, 1.0))
+            e_imp = float(np.clip((local_energy - energy) / max(local_energy, 1e-9), -1.0, 1.0))
+            reward = float(np.clip(self.preference[0] * d_imp + self.preference[1] * e_imp, -1.0, 1.0))
+            return reward, d_imp, e_imp
 
         # True DAG reward
         node_id = self.topo_order[self.current_node_idx]
         node_task = self.current_task['tasks'][node_id]
         cycles = node_task.get('cycles', 1e9)
-        action = self._last_action
-        
+
         # 1. Computation Improvement vs Local
         local_delay = cycles / self.local_freq
         local_energy = self.kappa * cycles * (self.local_freq ** 2)
-        
+
         comp_imp = (local_delay - delay) / max(local_delay, 1e-9)
         e_imp = (local_energy - energy) / max(local_energy, 1e-9)
-        
-        # 2. Congestion Penalty (Are we stacking load on this server?)
-        # Measure how long this task had to wait in the server's queue
-        wait_time = self.server_available[action] - self.node_finish_times[node_id] + delay
-        wait_time = max(0.0, wait_time)
-        congestion_penalty = min(wait_time / 5.0, 1.0)  # Max penalty if waited > 5 seconds
-        
-        # 3. Communication Penalty (Cross-server edges)
-        comm_penalty = 0.0
-        edges = self.current_task.get('edges', [])
-        for edge in edges:
-            if edge['target'] == node_id:
-                parent_id = edge['source']
-                if self.node_assignments[parent_id] != action:
-                    comm_data = float(edge.get('data', 0))
-                    comm_penalty += comm_data / max(self.bandwidth_up, 1e-9)
-        comm_penalty = min(comm_penalty, 1.0)
 
-        # Combine
-        combined_delay_metric = comp_imp - (w_cong * congestion_penalty) - (w_comm * comm_penalty)
-        total_improvement = self.preference[0] * combined_delay_metric + self.preference[1] * e_imp
+        # Both penalties below are relative overheads: "how large is this cost compared
+        # to just running the node locally?".  x / (x + local_delay) maps [0, inf) onto
+        # [0, 1) smoothly and never fully saturates, so the term keeps a gradient no
+        # matter how congested or how chatty the placement is.  A hard min(x/scale, 1)
+        # pins at exactly 1.0 — for these data-heavy DAGs (daggen --ccr 0.5) a single
+        # cross-server parent transfer already exceeds local_delay, so a hard clip would
+        # make comm_penalty binary and uninformative.
+        def _relative_overhead(cost: float) -> float:
+            denom = cost + max(local_delay, 1e-9)
+            return cost / denom if denom > 0 else 0.0
 
-        reward = float(np.clip(5.0 * total_improvement, -5.0, 5.0))
-        return reward
+        # 2. Congestion Penalty — how long this node actually sat in the target server's
+        # queue.  The old code recomputed wait_time after _execute_offloading had already
+        # overwritten server_available, which made it identically equal to `delay` — it
+        # never measured queueing at all.
+        congestion_penalty = _relative_overhead(self._last_queue_wait)
+
+        # 3. Communication Penalty — time spent pulling parent outputs across servers,
+        # using the transfer times actually incurred in _execute_offloading (computed at
+        # the Shannon datarate).  The old code divided raw edge bytes by the raw
+        # bandwidth_up, ~42x below the real datarate, so this saturated at 1.0 whenever
+        # any parent lived on another server.
+        comm_penalty = _relative_overhead(self._last_comm_time)
+
+        # Combine into the two objective components, each clipped independently.
+        r_delay = float(np.clip(
+            comp_imp - (w_cong * congestion_penalty) - (w_comm * comm_penalty), -1.0, 1.0
+        ))
+        r_energy = float(np.clip(e_imp, -1.0, 1.0))
+
+        reward = float(np.clip(
+            self.preference[0] * r_delay + self.preference[1] * r_energy, -1.0, 1.0
+        ))
+        return reward, r_delay, r_energy
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, Dict]:
         """Execute one step"""
@@ -604,8 +707,8 @@ class TaskOffloadingEnv(gym.Env):
         delay, energy = self._execute_offloading(action)
         
         # Calculate reward based on node-level metrics
-        reward = self._calculate_reward(delay, energy)
-        
+        reward, r_delay, r_energy = self._calculate_reward(delay, energy)
+
         # Update running metrics
         self.total_energy += energy
         self.completed_tasks += 1
@@ -630,6 +733,13 @@ class TaskOffloadingEnv(gym.Env):
         info = {
             'delay': delay,
             'energy': energy,
+            # Per-objective reward components, clipped to [-1, 1].  r_delay carries the
+            # congestion + communication penalties; r_energy is the energy improvement.
+            # Multi-objective learners should discount these, not raw delay/energy.
+            'r_delay': r_delay,
+            'r_energy': r_energy,
+            'queue_wait': self._last_queue_wait,
+            'comm_time': self._last_comm_time,
             'total_delay': self.total_delay,
             'makespan': self.total_delay,
             'total_energy': self.total_energy,

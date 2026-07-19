@@ -22,7 +22,18 @@ environment:
     cloud_power_tx: 0.5
     edge_power_tx: 0.3
     local_power: 0.1
-    kappa: 1.0e-28  # Effective switched capacitance
+    # Effective switched capacitance. local_energy = kappa * cycles * local_freq^2.
+    #
+    # Real DAG nodes take `cycles` from the .gv `expect_size` attribute (median ~2.8e7),
+    # NOT from task_cycles_range (~1e9, synthetic tasks only). At this kappa the median
+    # node costs 0.028 J locally, against 0.043 J on cloud and 0.018 J on edge — so edge
+    # is cheapest, local is middling, cloud is priciest, while delay runs the other way.
+    # That tension is what makes the Pareto front and hypervolume meaningful.
+    #
+    # Do NOT raise this to 1e-23: local energy becomes 283 J/node, ~6500x any offload
+    # action. total_energy then just counts local picks, and e_imp saturates at 0.9998
+    # for cloud vs 0.9999 for edge, leaving no gradient to tell servers apart.
+    kappa: 1.0e-27
 
   # Network Parameters
   network:
@@ -58,21 +69,61 @@ environment:
     # Poisson arrival
     poisson_lambda: 0.5
 
+# Reproducibility
+experiment:
+  # Seed for python/numpy/torch. Training was previously unseeded, so two Colab
+  # sessions on identical code produced policies whose reported metrics differed
+  # by orders of magnitude. A seed makes one run repeatable — it does not make one
+  # run representative. Benchmark over utils.seeding.SEEDS and report mean ± std.
+  seed: 42
+  deterministic_torch: false  # true = bit-exact CUDA kernels, slower
+
 # Training Parameters
 training:
   batch_size: 32
   num_episodes: 1000
   learning_rate: 3.0e-4
   gamma: 0.99
-  
+
+  # PPO surrogate objective (used inside the MAML inner loop, which reuses one
+  # on-policy batch for `inner_steps` gradient steps)
+  ppo_clip_eps: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+
   # Meta-learning
-  meta_batch_size: 8
-  num_meta_iterations: 300
-  inner_lr: 0.01
-  inner_steps: 3
-  
-  # Threshold-based communication
-  hypervolume_threshold: 0.7
+  # NOTE: `meta_batch_size` and `num_meta_iterations` are INERT — no Python code reads
+  # them. Iteration count and meta-batch size are passed directly to
+  # TAMPOFramework.train() by the caller: Colab_Test_Run.ipynb (NUM_ITERATIONS /
+  # META_BATCH_SIZE) for training runs, and main.py's `train_iterations` arg for the CLI.
+  # The Colab cell is intentionally the source of truth. Editing the values here has no
+  # effect; they are retained only as documentation of the intended defaults.
+  meta_batch_size: 8          # INERT — see note above
+  num_meta_iterations: 300    # INERT — see note above
+
+  # LIVE. Rollout episodes collected per sampled task, per meta-iteration.
+  # Wall-clock per iteration scales roughly linearly with this. Lowering it to 2-3 is the
+  # cheapest way to buy more optimiser steps inside a fixed Colab session; the cost is
+  # noisier per-task adaptation.
+  episodes_per_task: 5
+
+  inner_lr: 0.005   # reduced for stable MAML inner-loop adaptation
+  # Second-order MAML gradients dominate per-iteration cost. inner_steps scales it almost
+  # linearly. Reduce to 3 if you need cheaper iterations.
+  inner_steps: 5    # more steps → better per-task adaptation signal
+
+  # Threshold-based communication (TAMPO paper §3.2.3): an agent requests a meta-update
+  # only when its hypervolume moving average drops below this threshold.
+  # UNITS: HV is computed over negated improvements (costs in [-1,1]) against reference
+  # point [2,2], so a single-point front ranges from ~1.2 (uniformly poor, cost ~0.9)
+  # to ~8.4 (uniformly good, cost ~-0.9). A threshold below ~1.2 therefore NEVER fires;
+  # calibrate inside [1.5, 8] if the trigger is wired into a multi-agent experiment.
+  # NOTE: the current single-device training loop performs a meta-update every iteration
+  # unconditionally (equivalent to the trigger always firing), which is the right
+  # setting for the encoder comparison — the threshold mechanism is implemented and
+  # unit-tested but acts only when update_performance()/collect_updates() are driven
+  # by a distributed deployment loop.
+  hypervolume_threshold: 3.0
   moving_average_window: 50
 
 # Algorithm-specific configs
@@ -102,8 +153,48 @@ algorithms:
   tampo:
     enabled: true
     hidden_dims: [256, 256]
-    num_attention_heads: 8
-    encoder_type: 'gcn'  # Options: 'lstm', 'gcn'
-    meta_learning_rate: 3.0e-4
-    num_meta_iterations: 100
-    meta_batch_size: 10
+    num_attention_heads: 8   # INERT — decoder hardcodes num_heads=8
+    encoder_type: 'gcn'  # Options: 'lstm', 'gcn', 'gat'
+
+    # DO NOT RAISE without re-checking the action-entropy diagnostic.
+    # Measured sweep (12 iters, GCN + LSTM, seed 42):
+    #   5.0e-5 -> action entropy 0.72 / 0.77   (healthy)
+    #   1.5e-4 -> action entropy 0.00 / 0.00   (policy collapsed)
+    #   3.0e-4 -> action entropy 0.00 / 0.00   (policy collapsed)
+    # Losses stayed finite and trended DOWN in every case, so a loss curve alone will
+    # not reveal the collapse. Only `[actions] ... entropy=` does.
+    meta_learning_rate: 5.0e-5
+
+    # INERT — both are passed to train() by Colab_Test_Run.ipynb / main.py, not read here.
+    #
+    # Budget guidance (measured): Adam's mean |Δparam| per meta-iteration is ~9.3e-6 at
+    # meta_learning_rate 5.0e-5, against a mean |param| at init of ~0.029. So 75 iterations
+    # move the average weight only ~2.4% of its initial scale — essentially untrained.
+    # More optimiser steps are needed, and `meta_batch_size` does NOT buy them: Adam's step
+    # size is ~lr regardless of how many tasks the gradient averages over. Shrinking
+    # meta_batch_size trades gradient quality for more steps per hour, which is the trade
+    # you want on a time-limited Colab session.
+    #
+    # COST IS THE REAL CONSTRAINT. Measured per-iteration wall clock (CPU, meta_batch=4,
+    # graphs of 10/20/30 nodes) — LSTM is ~4x GCN because CuDNN must be disabled for
+    # MAML's second-order gradients:
+    #     gcn 3.3s | gat 4.1s | lstm 14.1s
+    # A free-tier T4 session (~4h) fits roughly 75 iterations of all three encoders at
+    # meta_batch_size=15. Train ONE encoder per session, use train(time_budget_s=...) so
+    # the run checkpoints cleanly before Colab kills it, and resume.
+    #
+    # Do not chase a fixed iteration number. Stop when `within_episode_entropy` in the
+    # benchmark rises off 0.000 and makespan plateaus across two consecutive checkpoints.
+    # See docs/READING_RESULTS.md.
+    num_meta_iterations: 1000   # INERT — aspirational total, reached by stacking sessions
+    meta_batch_size: 10         # INERT
+
+    # GNN encoder parameters.
+    # Both encoders emit `hidden_dim` per node per direction; forward ⊕ backward gives
+    # hidden_dim*2, matching the BiLSTM width so the three encoders are interchangeable.
+    gnn_hidden_dim: 16      # GCN intermediate dim (GDRL Feature.py uses 16)
+
+    # GAT encoder parameters (used only when encoder_type: 'gat')
+    num_gat_heads: 4        # attention heads for GATv2Conv layer 1
+    gat_hidden_dim: 16      # intermediate dim = num_gat_heads * (gat_hidden_dim // num_gat_heads)
+    gat_add_self_loops: true  # match GCNConv default for fair comparison
