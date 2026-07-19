@@ -275,16 +275,21 @@ class TaskOffloadingEnv(gym.Env):
         """
         Build a per-node feature matrix for the active task graph.
 
-        Feature layout:
-        [data_size, cycles, in_degree, out_degree, depth, comm_load]
+        Feature layout (width == TASK_FEATURE_DIM):
+        [data_size, cycles, in_degree, out_degree, depth, comm_load,
+         is_current, is_scheduled, assigned_server_norm]
         """
         if self.current_task is None:
-            return np.zeros((1, 6), dtype=np.float32)
+            return np.zeros((1, self.TASK_FEATURE_DIM), dtype=np.float32)
 
         if not self._is_dag_task():
             size_norm = self.current_task['size'] / max(self.task_size_range[1], 1.0)
             cycles_norm = self.current_task['cycles'] / max(self.task_cycles_range[1], 1.0)
-            return np.array([[size_norm, cycles_norm, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+            # A lone independent task is always the current, unscheduled node.
+            return np.array(
+                [[size_norm, cycles_norm, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]],
+                dtype=np.float32
+            )
 
         adj_matrix = np.asarray(self.current_task['adj_matrix'], dtype=np.float32)
         num_nodes = adj_matrix.shape[0]

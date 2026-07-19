@@ -713,6 +713,28 @@ class LowerLayerAgent:
         self.value_coef = config.get('value_loss_coef', 0.5)
         self.entropy_coef = config.get('entropy_coef', 0.01)
 
+        # Hypervolume tracking — the threshold-adaptive communication state of the TAMPO
+        # paper (§3.2.3): each agent tracks a moving average of its hypervolume and
+        # requests a meta-update only when it drops below hv_threshold. This block was
+        # accidentally stranded after a `return` in _old_log_probs when the PPO methods
+        # were inserted mid-class, so none of these attributes ever existed and every
+        # call into the trigger path raised AttributeError.
+        self.hv_threshold = config.get('hypervolume_threshold', 0.5)
+        self.hv_window = config.get('moving_average_window', 50)
+        self.hv_calculator = HypervolumeCalculator(
+            # RC#9: Reference point updated to [2.0, 2.0].
+            # After RC#1/#4 fix, mo_return values are normalised improvements in [-1, 1].
+            # A reference of 2.0 is safely above the maximum possible value of 1.0.
+            reference_point=np.array([2.0, 2.0])
+        )
+
+        self.performance_buffer = deque(maxlen=200)
+        self.hv_history = deque(maxlen=self.hv_window)
+
+        # Communication trigger
+        self.update_needed = False
+        self.update_package = None
+
     def _ppo_policy_loss(
         self,
         log_probs: torch.Tensor,
@@ -740,23 +762,6 @@ class LowerLayerAgent:
             np.array([exp['old_log_prob'] for exp in batch], dtype=np.float32)
         ).to(device)
 
-        # Hypervolume tracking
-        self.hv_threshold = config.get('hypervolume_threshold', 0.5)
-        self.hv_window = config.get('moving_average_window', 50)
-        self.hv_calculator = HypervolumeCalculator(
-            # RC#9: Reference point updated to [2.0, 2.0].
-            # After RC#1/#4 fix, mo_return values are normalised improvements in [-1, 1].
-            # A reference of 2.0 is safely above the maximum possible value of 1.0.
-            reference_point=np.array([2.0, 2.0])
-        )
-        
-        self.performance_buffer = deque(maxlen=200)
-        self.hv_history = deque(maxlen=self.hv_window)
-        
-        # Communication trigger
-        self.update_needed = False
-        self.update_package = None
-    
     def _prepare_policy_batch(
         self,
         batch: List[Dict]
@@ -841,6 +846,13 @@ class LowerLayerAgent:
         # RC#7: Disable dropout during inner-loop adaptation.
         # Stochastic dropout masks during create_graph=True produce inconsistent
         # second-order gradients across inner steps, destabilising MAML.
+        # Restore the PREVIOUS mode on exit rather than forcing train(): meta_update
+        # holds the policy in eval() across the whole task loop so the outer test-loss
+        # forward sees the same dropout-free regime as the inner loop and as the
+        # old_log_prob recorded at collection time. Forcing train() here re-enabled
+        # dropout for the outer loss, injecting noise into the PPO importance ratio
+        # (measured: same batch, two outer-loss evals differed 0.338 vs 0.276).
+        was_training = self.meta_policy.training
         self.meta_policy.eval()
         
         # Start with meta-policy parameters
@@ -887,8 +899,9 @@ class LowerLayerAgent:
             adapted_params = new_adapted_params
         
         self.adapted_params = adapted_params
-        # RC#7: Restore training mode after inner-loop adaptation.
-        self.meta_policy.train()
+        # RC#7: Restore the caller's mode (see note at the top of this method).
+        if was_training:
+            self.meta_policy.train()
         return adapted_params
     
     def _compute_loss_with_params(self, params_dict: Dict, batch: List[Dict]) -> torch.Tensor:
@@ -1036,12 +1049,18 @@ class LowerLayerAgent:
         Update performance buffer using normalised improvement values.
         RC#9: Now normalises to the same [-1,1] scale as mo_return so HV is meaningful.
         """
-        # Values are already normalised improvements after RC#1 fix;
-        # clamp to [-1,1] for safety and flip sign so higher = better for HV.
-        norm_delay_imp = float(np.clip(delay, -1.0, 1.0))
-        norm_energy_imp = float(np.clip(energy, -1.0, 1.0))
-        
-        self.performance_buffer.append([norm_delay_imp, norm_energy_imp])
+        # Values are normalised improvements (higher = better) after RC#1.
+        # HypervolumeCalculator uses a MINIMISATION convention (its Pareto filter keeps
+        # points with smaller coordinates, and HV grows as points move below the
+        # reference), so store the NEGATED improvements as costs in [-1, 1]. Without the
+        # negation the semantics invert: a uniformly poor agent (improvement -0.9)
+        # scored HV ~8.4 against reference [2,2] while a good one scored ~1.2, so the
+        # paper's "HV_avg < tau -> request meta-update" trigger could never fire for
+        # the agents that actually needed help.
+        norm_delay_cost = -float(np.clip(delay, -1.0, 1.0))
+        norm_energy_cost = -float(np.clip(energy, -1.0, 1.0))
+
+        self.performance_buffer.append([norm_delay_cost, norm_energy_cost])
         
         # Calculate hypervolume
         if len(self.performance_buffer) >= 20:
@@ -1154,6 +1173,16 @@ class HigherLayerMetaLearner:
 
         running_loss_sum = 0.0
 
+        # Hold the policy in eval() for the entire MAML computation — inner-loop
+        # adaptation AND the outer test-loss forward. Every log-prob the PPO ratio
+        # compares (collection-time old_log_prob, inner-step log-probs, outer-loss
+        # log-probs) is then computed under the identical dropout-free regime, and
+        # the second-order gradients stay consistent across the whole graph.
+        # Exploration comes from Categorical sampling at collection time, not dropout.
+        # (inner_loop_update also sets eval() and now restores the mode it found,
+        # so it no longer flips the policy back to train() mid-loop.)
+        self.meta_policy.eval()
+
         with torch.backends.cudnn.flags(enabled=cudnn_enabled):
             for task_data in task_batch:
                 if len(task_data['test_experiences']) == 0:
@@ -1203,6 +1232,11 @@ class HigherLayerMetaLearner:
                     # doesn't cause false OOMs on the NEXT task's forward pass.
                     if self.device.type == 'cuda':
                         torch.cuda.empty_cache()
+
+        # Leave the module in train() mode between meta-updates (the conventional
+        # resting state); every consumer — collection, inner loop, this method,
+        # benchmark — explicitly sets the mode it needs before any forward pass.
+        self.meta_policy.train()
 
         if valid_tasks == 0:
             print("WARNING: No valid tasks for meta-update!")
@@ -1740,10 +1774,16 @@ class TAMPOFramework:
             if features is not None:
                 return np.asarray(features, dtype=np.float32)
 
+        # Fallbacks must match the width the encoder was built for (env.task_feature_dim,
+        # 9 since the 2026-07-10 overhaul) — a 6-wide matrix crashes the GNN input layer.
+        dim = getattr(self.env, 'task_feature_dim', 9)
         if state is None:
-            return np.zeros((1, 6), dtype=np.float32)
+            return np.zeros((1, dim), dtype=np.float32)
 
-        return np.asarray(state[:6], dtype=np.float32).reshape(1, -1)
+        row = np.asarray(state[:6], dtype=np.float32)
+        if len(row) < dim:
+            row = np.pad(row, (0, dim - len(row)))
+        return row[:dim].reshape(1, -1)
     
     def _extract_server_features(self, state: Optional[np.ndarray] = None) -> np.ndarray:
         """Extract structured server features."""

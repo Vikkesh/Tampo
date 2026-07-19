@@ -56,7 +56,7 @@ class SequenceWrapper(gym.Wrapper):
     # ── observation builder ─────────────────────────────────────────────────
     def _build_sequence_obs(self) -> np.ndarray:
         """Read the current task graph from the env and return a sorted sequence."""
-        task_features = self.env.get_task_feature_matrix()  # [N, 6]
+        task_features = self.env.get_task_feature_matrix()  # [N, task_feature_dim]
         adj_matrix = self.env.get_adjacency_matrix()
 
         N = task_features.shape[0]

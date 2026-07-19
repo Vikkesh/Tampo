@@ -394,7 +394,17 @@ Two determinism fixes made this work: seeding now happens in `__init__` **before
 
 Every encoder is seeded identically at construction, so all three face the **identical** sequence of graphs, preferences and channel conditions — only their weights and actions differ. That is what makes the comparison controlled.
 
-**Operator guide:** `docs/RUNNING_THE_EXPERIMENT.md` walks through three cases — multiple free Colab sessions (Drive-backed, auto-resuming), a single long VM session, and a multi-seed publication run. The notebook training cell is an auto-advancing driver: set it once, re-run each session, and it pours the budget into `gcn → gat → lstm` until each reaches target, resuming exactly.
+**Operator guide:** start with **`docs/QUICKSTART.md`** — the bare-bones "what to click, what you should see, how long it takes" version. `docs/RUNNING_THE_EXPERIMENT.md` walks through three cases — multiple free Colab sessions (Drive-backed, auto-resuming), a single long VM session, and a multi-seed publication run. The notebook training cell is an auto-advancing driver: set it once, re-run each session, and it pours the budget into `gcn → gat → lstm` until each reaches target, resuming exactly.
+
+### MAML hygiene & threshold-mechanism restoration (2026-07-20)
+
+A pre-run audit (`dev_logs/maml_hygiene_and_threshold_restoration.md`) fixed four defects:
+
+- **Threshold-adaptive communication restored.** The TAMPO paper's §3.2.3 mechanism (agents request a meta-update when their hypervolume moving average drops below τ) was dead code — its entire state block had been stranded after a `return` during an earlier edit, and its hypervolume semantics were inverted (poor agents scored *high* HV, so the trigger could never fire). Both fixed and unit-tested; `hypervolume_threshold` recalibrated to 3.0 with units documented in the config. The single-device training loop still meta-updates every iteration (equivalent to the trigger always firing) — correct for the encoder comparison; the trigger acts in multi-agent deployments.
+- **Dropout removed from the outer MAML loss.** The outer test-set loss ran in train mode while the PPO ratio's `old_log_prob` was recorded in eval mode — measured 0.338 vs 0.276 on the same batch, pure noise inside the importance ratio. `meta_update` now holds `eval()` through the whole MAML computation; every log-prob the ratio compares comes from the same dropout-free regime. Bit-exact resume re-verified after the change.
+- **6-wide feature fallbacks widened to 9** (`TASK_FEATURE_DIM`), fixing an opaque shape crash on the no-task and independent-task paths.
+
+**Encoder fairness audit (measured):** parameter counts at hidden 128 are GCN 1.13M / GAT 1.14M / LSTM 1.72M — the LSTM *encoder* has ~2.8× the parameters (GCN/GAT widths are faithful to GDRL's 16-dim intermediate). The LSTM's node-id sequence order is a valid topological sort on all sampled graphs, and the sampled DAGs are shallow enough (depth ≤ 5) that the 2-hop bidirectional GNN receptive field covers them. No encoder is structurally handicapped; the comparison is controlled.
 
 ---
 

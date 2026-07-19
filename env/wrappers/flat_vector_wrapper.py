@@ -32,7 +32,7 @@ class FlatVectorWrapper(gym.Wrapper):
 
     def _build_flat_obs(self) -> np.ndarray:
         """Pull real graph features and server state from the environment."""
-        task_features = self.env.get_task_feature_matrix()   # [N, 6]
+        task_features = self.env.get_task_feature_matrix()   # [N, task_feature_dim]
         server_features = self.env.get_server_features()     # [20]
 
         N = task_features.shape[0]

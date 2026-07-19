@@ -112,8 +112,18 @@ training:
   # linearly. Reduce to 3 if you need cheaper iterations.
   inner_steps: 5    # more steps → better per-task adaptation signal
 
-  # Threshold-based communication
-  hypervolume_threshold: 0.7
+  # Threshold-based communication (TAMPO paper §3.2.3): an agent requests a meta-update
+  # only when its hypervolume moving average drops below this threshold.
+  # UNITS: HV is computed over negated improvements (costs in [-1,1]) against reference
+  # point [2,2], so a single-point front ranges from ~1.2 (uniformly poor, cost ~0.9)
+  # to ~8.4 (uniformly good, cost ~-0.9). A threshold below ~1.2 therefore NEVER fires;
+  # calibrate inside [1.5, 8] if the trigger is wired into a multi-agent experiment.
+  # NOTE: the current single-device training loop performs a meta-update every iteration
+  # unconditionally (equivalent to the trigger always firing), which is the right
+  # setting for the encoder comparison — the threshold mechanism is implemented and
+  # unit-tested but acts only when update_performance()/collect_updates() are driven
+  # by a distributed deployment loop.
+  hypervolume_threshold: 3.0
   moving_average_window: 50
 
 # Algorithm-specific configs
