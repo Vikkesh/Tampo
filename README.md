@@ -21,9 +21,9 @@ Most standard offloading environments treat tasks as independent or evaluate the
 #### 2. The Three-Component Penalty Reward System
 Because standard DRL agents tend to collapse into "lazy" local minimum policies (e.g., exclusively offloading to the Cloud), the reward system applies distinct pressures to force the agent to balance trade-offs. The total reward combines:
 
-1.  🚀 **Computation Improvement (The Carrot):** The environment calculates how much faster a task runs on the selected server compared to the baseline of running it locally on the mobile device. 
-2.  🚦 **Server Congestion Penalty (The Stick):** If an agent repeatedly chooses the same high-powered server (e.g., the Cloud), it is penalized by how long the task actually sat in that server's queue. This forces the agent to dynamically distribute load across Edge and Local devices.
-3.  📡 **Communication Penalty (The Stick):** If two tightly coupled tasks (a parent and its child) are scheduled on different machines, the agent is penalized by the transmission time actually incurred. This encourages algorithms to group dependent tasks together logically.
+1.  **Computation Improvement (The Carrot):** The environment calculates how much faster a task runs on the selected server compared to the baseline of running it locally on the mobile device. 
+2.  **Server Congestion Penalty (The Stick):** If an agent repeatedly chooses the same high-powered server (e.g., the Cloud), it is penalized by how long the task actually sat in that server's queue. This forces the agent to dynamically distribute load across Edge and Local devices.
+3.  **Communication Penalty (The Stick):** If two tightly coupled tasks (a parent and its child) are scheduled on different machines, the agent is penalized by the transmission time actually incurred. This encourages algorithms to group dependent tasks together logically.
 
 Both penalties are expressed as a **relative overhead**, `cost / (cost + local_delay)` ∈ [0, 1) — dimensionless, smooth, and never fully saturated, so the term keeps a usable gradient at any congestion level and needs no retuning when task sizes or clock speeds change.
 
